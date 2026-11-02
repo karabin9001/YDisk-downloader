@@ -78,34 +78,46 @@ def format_eta(seconds):
         return f"{h}ч {m}мин"
     return f"{m}мин {s}сек"
 
+API_BASE = 'https://cloud-api.yandex.net/v1/disk/public/resources'
+# Символы, которые нельзя использовать в именах файлов на Windows
+WIN_FORBIDDEN = '<>:"|?*'
+
+def _auth_headers(token):
+    return {'Authorization': f'OAuth {token.strip()}'} if token else {}
+
 def get_public_resources(public_key, path='', token=None, offset=0, limit=100):
     params = {'public_key': public_key, 'limit': limit, 'offset': offset}
     if path:
         params['path'] = path
-    headers = {}
-    if token:
-        headers['Authorization'] = f'OAuth {token.strip()}'
-    r = requests.get('https://cloud-api.yandex.net/v1/disk/public/resources', params=params, headers=headers, timeout=25)
-    r.raise_for_status()
-    return r.json()
+    last_error = None
+    for attempt in range(3):
+        try:
+            r = requests.get(API_BASE, params=params, headers=_auth_headers(token), timeout=25)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise Exception(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            return r.json()
+        except requests.HTTPError:
+            raise
+        except Exception as e:
+            last_error = e
+            time.sleep(2 * (attempt + 1))
+    raise Exception(f"API Яндекса не отвечает: {last_error}")
 
-def scan_folder_recursive(public_key, path='', token=None):
+def scan_folder_recursive(public_key, path='', token=None, dirs=None):
+    """Возвращает список файлов папки со всеми подпапками. Пути подпапок складывает в dirs."""
     files = []
     offset = 0
     limit = 100
     while True:
-        try:
-            data = get_public_resources(public_key, path=path, token=token, offset=offset, limit=limit)
-        except Exception as e:
-            add_log(f"⚠️ Ошибка чтения структуры {path or 'корня'}: {e}")
-            break
-        embedded = data.get('_embedded', {})
-        items = embedded.get('items', [])
-        if not items:
-            break
+        # Ошибку не глушим: иначе папка молча скачается не полностью
+        data = get_public_resources(public_key, path=path, token=token, offset=offset, limit=limit)
+        items = data.get('_embedded', {}).get('items', [])
         for it in items:
             if it.get('type') == 'dir':
-                files.extend(scan_folder_recursive(public_key, it.get('path'), token=token))
+                if dirs is not None:
+                    dirs.append(it.get('path'))
+                files.extend(scan_folder_recursive(public_key, it.get('path'), token=token, dirs=dirs))
             else:
                 files.append({
                     'name': it.get('name'),
@@ -117,15 +129,43 @@ def scan_folder_recursive(public_key, path='', token=None):
         offset += limit
     return files
 
+def safe_rel_path(remote_path: str) -> Path:
+    """Превращает путь с Диска в безопасный относительный путь (без '..' и запрещённых символов)."""
+    parts = []
+    for part in remote_path.replace('\\', '/').split('/'):
+        if part in ('', '.', '..'):
+            continue
+        if os.name == 'nt':
+            part = ''.join('_' if c in WIN_FORBIDDEN else c for c in part).rstrip(' .') or '_'
+        parts.append(part)
+    return Path(*parts) if parts else Path('_')
+
 def get_download_link(public_key, path, token=None):
-    params = {'public_key': public_key, 'path': path}
-    headers = {}
-    if token:
-        headers['Authorization'] = f'OAuth {token.strip()}'
-    r = requests.get('https://cloud-api.yandex.net/v1/disk/public/resources/download', params=params, headers=headers, timeout=25)
+    params = {'public_key': public_key}
+    if path:
+        params['path'] = path
+    r = requests.get(f'{API_BASE}/download', params=params, headers=_auth_headers(token), timeout=25)
     if r.status_code == 200:
-        return r.json().get('href')
-    return None
+        href = r.json().get('href')
+        if href:
+            return href
+    try:
+        reason = r.json().get('message') or r.json().get('description') or ''
+    except ValueError:
+        reason = ''
+    raise Exception(f"Яндекс не выдал ссылку на файл (HTTP {r.status_code}). {reason}".strip())
+
+def wait_while_paused():
+    while state["is_paused"] and not state["should_stop"]:
+        time.sleep(0.3)
+
+def mark_file_done(item, status):
+    with lock:
+        state["completed_list"].append({"name": item['dest_path'].name, "size": item['size'], "status": status})
+        fm = state["folders"][item['folder_idx']]
+        fm['done_files'] += 1
+        fm['done_gb'] = round(fm['done_gb'] + (item['size'] / (1024**3)), 2)
+        fm['status'] = 'done' if fm['done_files'] >= fm['total_files'] else 'active'
 
 def download_worker(urls: list, dest_dir: Path, token: str = None):
     with lock:
@@ -134,7 +174,10 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
         state["should_stop"] = False
         state["status_text"] = "Сканирование ссылок на Яндекс Диске..."
         state["completed_list"] = []
+        state["folders"] = []
         state["logs"] = []
+        state["downloaded_bytes"] = 0
+        state["overall_percent"] = 0.0
 
     add_log(f"🚀 Запуск очереди скачивания. Папка назначения: {dest_dir}")
 
@@ -145,34 +188,48 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
         raw_url = raw_url.strip()
         if not raw_url:
             continue
+        if state["should_stop"]:
+            break
         add_log(f"🔍 Сканирование ссылки: {raw_url}")
         try:
             root_info = get_public_resources(raw_url, limit=1, token=token)
-            folder_name = root_info.get('name', 'Яндекс_Файлы')
-            target_folder = dest_dir / folder_name
-            target_folder.mkdir(parents=True, exist_ok=True)
+            root_name = root_info.get('name') or 'Яндекс_Файлы'
 
-            files = scan_folder_recursive(raw_url, token=token)
-            add_log(f"📁 Папка '{folder_name}': найдено {len(files)} файлов")
-            
-            f_meta = {
-                "name": folder_name,
+            if root_info.get('type') == 'file':
+                # Ссылка ведёт на один файл, а не на папку
+                target_folder = dest_dir
+                files = [{'name': root_name, 'path': '', 'size': root_info.get('size', 0)}]
+                dirs = []
+            else:
+                target_folder = dest_dir / safe_rel_path(root_name)
+                dirs = []
+                files = scan_folder_recursive(raw_url, token=token, dirs=dirs)
+
+            target_folder.mkdir(parents=True, exist_ok=True)
+            # Создаём и пустые подпапки, чтобы структура совпадала с Диском
+            for d in dirs:
+                (target_folder / safe_rel_path(d)).mkdir(parents=True, exist_ok=True)
+
+            add_log(f"📁 '{root_name}': найдено {len(files)} файлов")
+
+            folder_idx = len(folders_meta)
+            folders_meta.append({
+                "name": root_name,
                 "url": raw_url,
                 "total_files": len(files),
                 "done_files": 0,
                 "total_gb": round(sum(f['size'] for f in files) / (1024**3), 2),
                 "done_gb": 0.0,
                 "status": "wait"
-            }
-            folders_meta.append(f_meta)
+            })
 
             for f in files:
-                rel = f['path'].lstrip('/')
+                dest = target_folder / (safe_rel_path(f['path']) if f['path'] else safe_rel_path(root_name))
                 all_files_queue.append({
                     "public_key": raw_url,
-                    "folder_name": folder_name,
+                    "folder_idx": folder_idx,
                     "remote_path": f['path'],
-                    "dest_path": target_folder / rel,
+                    "dest_path": dest,
                     "name": f['name'],
                     "size": f['size']
                 })
@@ -191,16 +248,19 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
     add_log(f"📦 Итого в очереди: {total_files} файлов ({total_bytes / (1024**3):.2f} GB)")
 
     downloaded_total_bytes = 0
+    failed_files = []
+    max_attempts = 4
+
+    def update_overall():
+        with lock:
+            state["downloaded_bytes"] = downloaded_total_bytes
+            state["overall_percent"] = (downloaded_total_bytes / total_bytes * 100) if total_bytes else 100
 
     for idx, item in enumerate(all_files_queue, 1):
+        wait_while_paused()
         if state["should_stop"]:
             add_log("⏹️ Загрузка остановлена пользователем.")
             break
-
-        while state["is_paused"]:
-            if state["should_stop"]:
-                break
-            time.sleep(0.3)
 
         dest = item['dest_path']
         expected_size = item['size']
@@ -215,22 +275,13 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
         if dest.exists() and dest.stat().st_size == expected_size:
             downloaded_total_bytes += expected_size
             add_log(f"[{idx}/{total_files}] ⏭️ Уже скачан: {dest.name}")
-            with lock:
-                state["completed_list"].append({"name": dest.name, "size": expected_size, "status": "Уже был"})
-                fn = item.get('folder_name')
-                if fn:
-                    for fm in state["folders"]:
-                        if fm['name'] == fn:
-                            fm['done_files'] += 1
-                            fm['done_gb'] = round(fm['done_gb'] + (expected_size / (1024**3)), 2)
-                            fm['status'] = 'done' if fm['done_files'] >= fm['total_files'] else 'active'
-                            break
-                state["overall_percent"] = (downloaded_total_bytes / total_bytes * 100) if total_bytes else 100
+            mark_file_done(item, "Уже был")
+            update_overall()
             continue
 
         # Скачивание файла
         dest.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = dest.with_suffix(dest.suffix + ".part")
+        temp_path = dest.with_name(dest.name + ".part")
         start_byte = 0
         if temp_path.exists():
             start_byte = temp_path.stat().st_size
@@ -238,115 +289,126 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
                 temp_path.unlink()
                 start_byte = 0
 
+        # Сколько байт этого файла уже учтено в общем прогрессе
+        file_counted = start_byte
+        downloaded_total_bytes += start_byte
+
         add_log(f"[{idx}/{total_files}] ⬇️ Скачивание: {dest.name} ({expected_size / (1024*1024):.1f} MB)")
         success = False
+        attempt = 0
 
-        for attempt in range(1, 5):
+        while attempt < max_attempts:
+            wait_while_paused()
             if state["should_stop"]:
                 break
 
-            while state["is_paused"]:
-                if state["should_stop"]:
-                    break
-                time.sleep(0.3)
-
+            paused_mid_file = False
             try:
-                href = get_download_link(item['public_key'], item['remote_path'], token=token)
-                if not href:
-                    raise Exception("Не получен прямой href от Яндекс.Диска (возможно, лимит скачивания)")
+                if not (expected_size and start_byte == expected_size):
+                    # Ссылка CDN живёт недолго, поэтому берём новую на каждую попытку
+                    href = get_download_link(item['public_key'], item['remote_path'], token=token)
 
-                headers = {}
-                if start_byte > 0:
-                    headers['Range'] = f'bytes={start_byte}-'
+                    headers = {}
+                    if start_byte > 0:
+                        headers['Range'] = f'bytes={start_byte}-'
 
-                t_start = time.time()
-                bytes_in_session = 0
+                    t_start = time.time()
+                    bytes_in_session = 0
 
-                with requests.get(href, headers=headers, stream=True, timeout=30) as r:
-                    if r.status_code not in (200, 206):
-                        raise Exception(f"HTTP статус: {r.status_code}")
+                    with requests.get(href, headers=headers, stream=True, timeout=30) as r:
+                        if r.status_code not in (200, 206):
+                            raise Exception(f"HTTP статус: {r.status_code}")
 
-                    if r.status_code == 206:
-                        mode = 'ab'
-                        current_file_downloaded = start_byte
-                    else:
-                        mode = 'wb'
-                        current_file_downloaded = 0
-                        start_byte = 0
+                        if r.status_code == 206:
+                            mode = 'ab'
+                            current_file_downloaded = start_byte
+                        else:
+                            # Сервер отдал файл с начала: убираем из прогресса то, что считали раньше
+                            mode = 'wb'
+                            current_file_downloaded = 0
+                            start_byte = 0
+                            downloaded_total_bytes -= file_counted
+                            file_counted = 0
 
-                    with open(temp_path, mode) as f:
-                        for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
-                            if state["should_stop"]:
-                                break
-
-                            while state["is_paused"]:
+                        with open(temp_path, mode) as f:
+                            for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
                                 if state["should_stop"]:
                                     break
-                                time.sleep(0.3)
+                                if state["is_paused"]:
+                                    # Рвём соединение: за долгую паузу CDN всё равно его закроет
+                                    paused_mid_file = True
+                                    break
+                                if not chunk:
+                                    continue
+                                f.write(chunk)
+                                c_len = len(chunk)
+                                current_file_downloaded += c_len
+                                bytes_in_session += c_len
+                                downloaded_total_bytes += c_len
+                                file_counted += c_len
 
-                            if not chunk:
-                                continue
-                            f.write(chunk)
-                            c_len = len(chunk)
-                            current_file_downloaded += c_len
-                            bytes_in_session += c_len
-                            downloaded_total_bytes += c_len
+                                elapsed = time.time() - t_start
+                                spd = bytes_in_session / elapsed if elapsed > 0 else 0
+                                spd_mb = spd / (1024 * 1024)
+                                remain_bytes = max(0, total_bytes - downloaded_total_bytes)
+                                eta = remain_bytes / spd if spd > 0 else None
+                                pct = (current_file_downloaded / expected_size * 100) if expected_size > 0 else 0
 
-                            now = time.time()
-                            elapsed = now - t_start
-                            spd = bytes_in_session / elapsed if elapsed > 0 else 0
-                            spd_mb = spd / (1024 * 1024)
-                            remain_bytes = max(0, expected_size - current_file_downloaded)
-                            eta = remain_bytes / spd if spd > 0 else 0
-                            pct = (current_file_downloaded / expected_size * 100) if expected_size > 0 else 0
-                            ov_pct = (downloaded_total_bytes / total_bytes * 100) if total_bytes > 0 else 0
-
-                            with lock:
-                                state["file_percent"] = pct
-                                state["file_downloaded_mb"] = current_file_downloaded / (1024 * 1024)
-                                state["speed_mbs"] = spd_mb
-                                state["speed_str"] = f"{spd_mb:.1f} MB/s"
-                                state["eta_str"] = format_eta(eta)
-                                state["overall_percent"] = ov_pct
-                                state["downloaded_bytes"] = downloaded_total_bytes
+                                with lock:
+                                    state["file_percent"] = pct
+                                    state["file_downloaded_mb"] = current_file_downloaded / (1024 * 1024)
+                                    state["speed_mbs"] = spd_mb
+                                    state["speed_str"] = f"{spd_mb:.1f} MB/s"
+                                    state["eta_str"] = format_eta(eta)
+                                update_overall()
 
                 if state["should_stop"]:
                     break
 
-                if temp_path.exists():
-                    if dest.exists():
-                        dest.unlink()
-                    temp_path.rename(dest)
+                start_byte = temp_path.stat().st_size if temp_path.exists() else 0
+                if paused_mid_file:
+                    # Пауза не считается неудачной попыткой
+                    continue
+
+                if expected_size and start_byte != expected_size:
+                    raise Exception(f"Соединение оборвалось: получено {start_byte} из {expected_size} байт")
+
+                if not temp_path.exists():
+                    # Пустой файл: сервер мог не прислать ни одного байта
+                    temp_path.touch()
+                os.replace(temp_path, dest)
                 add_log(f"[{idx}/{total_files}] ✅ Готово: {dest.name}")
-                with lock:
-                    state["completed_list"].append({"name": dest.name, "size": expected_size, "status": "Скачан"})
-                    fn = item.get('folder_name')
-                    if fn:
-                        for fm in state["folders"]:
-                            if fm['name'] == fn:
-                                fm['done_files'] += 1
-                                fm['done_gb'] = round(fm['done_gb'] + (expected_size / (1024**3)), 2)
-                                fm['status'] = 'done' if fm['done_files'] >= fm['total_files'] else 'active'
-                                break
+                mark_file_done(item, "Скачан")
                 success = True
                 break
 
             except Exception as e:
-                add_log(f"   ⚠️ Сбой (попытка {attempt}/4): {e}")
+                attempt += 1
+                add_log(f"   ⚠️ Сбой (попытка {attempt}/{max_attempts}): {e}")
                 if temp_path.exists():
                     start_byte = temp_path.stat().st_size
-                time.sleep(3)
+                if attempt < max_attempts:
+                    time.sleep(3 * attempt)
 
         if not success and not state["should_stop"]:
+            failed_files.append(dest.name)
             add_log(f"[{idx}/{total_files}] ❌ Не удалось скачать: {dest.name}")
 
     with lock:
         state["is_running"] = False
         state["is_paused"] = False
-        state["status_text"] = "Загрузка завершена!" if not state["should_stop"] else "Загрузка остановлена"
+        if state["should_stop"]:
+            state["status_text"] = "Загрузка остановлена"
+        elif failed_files:
+            state["status_text"] = f"Завершено с ошибками: не скачано {len(failed_files)} файл(ов). Нажмите «Старт» ещё раз, чтобы докачать"
+        else:
+            state["status_text"] = "Загрузка завершена!"
+        state["current_file"] = ""
         state["speed_str"] = "0 MB/s"
         state["eta_str"] = "--:--"
 
+    if failed_files:
+        add_log(f"⚠️ Не скачано файлов: {len(failed_files)}: " + ", ".join(failed_files[:20]) + (" …" if len(failed_files) > 20 else ""))
     add_log("🏁 Работа загрузчика завершена.")
 
 # ==========================================
@@ -388,7 +450,7 @@ INDEX_HTML = """<!DOCTYPE html>
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
     .field-group { display: flex; flex-direction: column; gap: 6px; }
     label { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-    textarea, input[type="text"] {
+    textarea, input[type="text"], input[type="password"] {
       background: #0d1117;
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -398,7 +460,7 @@ INDEX_HTML = """<!DOCTYPE html>
       outline: none;
       transition: border-color 0.2s;
     }
-    textarea:focus, input[type="text"]:focus { border-color: var(--accent); }
+    textarea:focus, input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); }
     textarea { resize: vertical; min-height: 65px; font-family: monospace; }
 
     .toggle-section { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; color: var(--muted); }
@@ -480,7 +542,7 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
       <div id="tokenGroup" class="field-group hidden">
         <label>OAuth Токен Яндекса:</label>
-        <input type="text" id="tokenInput" placeholder="y0__wgB...">
+        <input type="password" id="tokenInput" placeholder="y0__wgB..." autocomplete="off">
       </div>
 
       <div class="controls-row">
@@ -558,6 +620,11 @@ INDEX_HTML = """<!DOCTYPE html>
   <script>
     let isCurrentlyPaused = false;
 
+    // Имена файлов приходят из чужих папок — экранируем перед вставкой в HTML
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+    }
+
     document.addEventListener("DOMContentLoaded", () => {
       fetch("/api/default_dest")
         .then(r => r.json())
@@ -566,6 +633,14 @@ INDEX_HTML = """<!DOCTYPE html>
         });
       setInterval(pollStatus, 1000);
     });
+
+    function postJSON(url, data) {
+      return fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data || {})
+      });
+    }
 
     function toggleToken() {
       const g = document.getElementById("tokenGroup");
@@ -601,14 +676,14 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function togglePause() {
       if (isCurrentlyPaused) {
-        fetch("/api/resume", { method: "POST" })
+        postJSON("/api/resume")
           .then(r => r.json())
           .then(() => {
             isCurrentlyPaused = false;
             updateControlsState(true, false);
           });
       } else {
-        fetch("/api/pause", { method: "POST" })
+        postJSON("/api/pause")
           .then(r => r.json())
           .then(() => {
             isCurrentlyPaused = true;
@@ -618,7 +693,7 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     function stopDownload() {
-      fetch("/api/stop", { method: "POST" })
+      postJSON("/api/stop")
         .then(r => r.json())
         .then(() => {
           updateControlsState(false, false);
@@ -689,7 +764,7 @@ INDEX_HTML = """<!DOCTYPE html>
                 <div style="background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; display: flex; flex-direction: column; gap: 6px;">
                   <div style="display: flex; justify-content: space-between; align-items: center;">
                     <div>
-                      <div style="font-size: 13px; font-weight: 600; color: var(--text-white);">${f.name}</div>
+                      <div style="font-size: 13px; font-weight: 600; color: var(--text-white);">${esc(f.name)}</div>
                       <div style="font-size: 11px; color: var(--muted); margin-top: 2px;">${f.done_files} из ${f.total_files} файлов • ${f.done_gb} / ${f.total_gb} GB</div>
                     </div>
                     <span style="font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; ${badgeStyle}">${badgeText}</span>
@@ -703,7 +778,7 @@ INDEX_HTML = """<!DOCTYPE html>
           }
 
           const term = document.getElementById("termLogs");
-          term.innerHTML = data.logs.join("\\n");
+          term.textContent = data.logs.join("\\n");
           term.scrollTop = term.scrollHeight;
         });
     }
@@ -711,6 +786,8 @@ INDEX_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+ALLOWED_HOSTS = {f"{HOST}:{PORT}", f"localhost:{PORT}"}
 
 class RequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, data, status=200):
@@ -721,7 +798,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _is_trusted(self):
+        # Защита от DNS rebinding: страница должна быть открыта именно с нашего адреса
+        if self.headers.get('Host', '') not in ALLOWED_HOSTS:
+            return False
+        # Защита от запросов с чужих сайтов: Origin, если он есть, должен совпадать с нашим
+        origin = self.headers.get('Origin')
+        if origin and urllib.parse.urlparse(origin).netloc not in ALLOWED_HOSTS:
+            return False
+        return True
+
     def do_GET(self):
+        if not self._is_trusted():
+            self.send_error(403)
+            return
         if self.path in ('/', '/index.html'):
             body = INDEX_HTML.encode('utf-8')
             self.send_response(200)
@@ -733,41 +823,71 @@ class RequestHandler(BaseHTTPRequestHandler):
             default_dir = Path.home() / "Downloads" / "Yandex_Disk"
             self._send_json({"path": str(default_dir)})
         elif self.path == '/api/status':
+            # Сериализуем под замком, а отправляем без него, чтобы не тормозить загрузку
             with lock:
-                self._send_json(dict(state))
+                snapshot = json.loads(json.dumps(state, ensure_ascii=False))
+            self._send_json(snapshot)
         else:
             self.send_error(404)
 
     def do_POST(self):
+        # Чужой сайт может отправить простой POST без preflight, но не с application/json
+        if not self._is_trusted() or not self.headers.get('Content-Type', '').startswith('application/json'):
+            self.send_error(403)
+            return
+
         if self.path == '/api/start':
-            if state["is_running"] and not state["is_paused"]:
-                self._send_json({"status": "error", "message": "Загрузка уже идёт"}, 400)
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                payload = json.loads(self.rfile.read(content_length).decode('utf-8') or '{}')
+            except (ValueError, UnicodeDecodeError):
+                self._send_json({"status": "error", "message": "Некорректный запрос"}, 400)
                 return
-            if state["is_paused"]:
-                with lock:
+
+            with lock:
+                if state["is_running"] and state["is_paused"]:
                     state["is_paused"] = False
                     state["status_text"] = "Возобновление загрузки..."
+                    resumed = True
+                elif state["is_running"]:
+                    self._send_json({"status": "error", "message": "Загрузка уже идёт или ещё останавливается"}, 400)
+                    return
+                else:
+                    resumed = False
+            if resumed:
                 add_log("▶️ Загрузка продолжена.")
                 self._send_json({"status": "started"})
                 return
 
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length)
-            payload = json.loads(body.decode('utf-8'))
+            urls = [u for u in payload.get('urls', []) if isinstance(u, str) and u.strip()]
+            dest_str = str(payload.get('dest', '')).strip()
+            token = str(payload.get('token', '')).strip() or None
+            if not urls or not dest_str:
+                self._send_json({"status": "error", "message": "Нужны ссылки и папка для сохранения"}, 400)
+                return
 
-            urls = payload.get('urls', [])
-            dest_str = payload.get('dest', '')
-            token = payload.get('token', '').strip() or None
+            try:
+                dest_path = Path(dest_str).expanduser().resolve()
+                dest_path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                self._send_json({"status": "error", "message": f"Не удалось создать папку: {e}"}, 400)
+                return
 
-            dest_path = Path(dest_str).expanduser().resolve()
-            dest_path.mkdir(parents=True, exist_ok=True)
-
+            with lock:
+                # Ставим флаг сразу, чтобы двойной клик не запустил два потока
+                if state["is_running"]:
+                    self._send_json({"status": "error", "message": "Загрузка уже идёт"}, 400)
+                    return
+                state["is_running"] = True
             t = threading.Thread(target=download_worker, args=(urls, dest_path, token), daemon=True)
             t.start()
             self._send_json({"status": "started"})
 
         elif self.path == '/api/pause':
             with lock:
+                if not state["is_running"]:
+                    self._send_json({"status": "error", "message": "Нечего ставить на паузу"}, 400)
+                    return
                 state["is_paused"] = True
                 state["status_text"] = "Загрузка на паузе ⏸️"
                 state["speed_str"] = "0 MB/s"
