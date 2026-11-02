@@ -54,6 +54,7 @@ state = {
     "total_bytes": 0,
     "downloaded_bytes": 0,
     "completed_list": [],
+    "folders": [],
     "logs": []
 }
 
@@ -138,6 +139,8 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
     add_log(f"🚀 Запуск очереди скачивания. Папка назначения: {dest_dir}")
 
     all_files_queue = []
+    folders_meta = []
+
     for raw_url in urls:
         raw_url = raw_url.strip()
         if not raw_url:
@@ -151,10 +154,23 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
 
             files = scan_folder_recursive(raw_url, token=token)
             add_log(f"📁 Папка '{folder_name}': найдено {len(files)} файлов")
+            
+            f_meta = {
+                "name": folder_name,
+                "url": raw_url,
+                "total_files": len(files),
+                "done_files": 0,
+                "total_gb": round(sum(f['size'] for f in files) / (1024**3), 2),
+                "done_gb": 0.0,
+                "status": "wait"
+            }
+            folders_meta.append(f_meta)
+
             for f in files:
                 rel = f['path'].lstrip('/')
                 all_files_queue.append({
                     "public_key": raw_url,
+                    "folder_name": folder_name,
                     "remote_path": f['path'],
                     "dest_path": target_folder / rel,
                     "name": f['name'],
@@ -169,6 +185,7 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
     with lock:
         state["total_files"] = total_files
         state["total_bytes"] = total_bytes
+        state["folders"] = folders_meta
         state["status_text"] = f"Скачивание файлов (всего {total_files} шт, {total_bytes / (1024**3):.2f} GB)"
 
     add_log(f"📦 Итого в очереди: {total_files} файлов ({total_bytes / (1024**3):.2f} GB)")
@@ -200,6 +217,14 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
             add_log(f"[{idx}/{total_files}] ⏭️ Уже скачан: {dest.name}")
             with lock:
                 state["completed_list"].append({"name": dest.name, "size": expected_size, "status": "Уже был"})
+                fn = item.get('folder_name')
+                if fn:
+                    for fm in state["folders"]:
+                        if fm['name'] == fn:
+                            fm['done_files'] += 1
+                            fm['done_gb'] = round(fm['done_gb'] + (expected_size / (1024**3)), 2)
+                            fm['status'] = 'done' if fm['done_files'] >= fm['total_files'] else 'active'
+                            break
                 state["overall_percent"] = (downloaded_total_bytes / total_bytes * 100) if total_bytes else 100
             continue
 
@@ -295,6 +320,14 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
                 add_log(f"[{idx}/{total_files}] ✅ Готово: {dest.name}")
                 with lock:
                     state["completed_list"].append({"name": dest.name, "size": expected_size, "status": "Скачан"})
+                    fn = item.get('folder_name')
+                    if fn:
+                        for fm in state["folders"]:
+                            if fm['name'] == fn:
+                                fm['done_files'] += 1
+                                fm['done_gb'] = round(fm['done_gb'] + (expected_size / (1024**3)), 2)
+                                fm['status'] = 'done' if fm['done_files'] >= fm['total_files'] else 'active'
+                                break
                 success = True
                 break
 
@@ -512,6 +545,12 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- Очередь по папкам -->
+      <div id="foldersSection" style="display: none; flex-direction: column; gap: 8px; margin-top: 6px;">
+        <div style="font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">📁 Очередь по ссылкам и папкам</div>
+        <div id="foldersList" style="display: flex; flex-direction: column; gap: 8px;"></div>
+      </div>
+
       <div class="terminal" id="termLogs"></div>
     </div>
   </div>
@@ -630,6 +669,38 @@ INDEX_HTML = """<!DOCTYPE html>
 
           document.getElementById("overallPct").innerText = `${data.overall_percent.toFixed(1)}%`;
           document.getElementById("overallProgressFill").style.width = `${data.overall_percent}%`;
+
+          if (data.folders && data.folders.length > 0) {
+            document.getElementById("foldersSection").style.display = "flex";
+            const fl = document.getElementById("foldersList");
+            fl.innerHTML = data.folders.map(f => {
+              const pct = f.total_files ? ((f.done_files / f.total_files) * 100).toFixed(0) : 0;
+              let badgeStyle = "background: rgba(139,148,158,0.15); color: var(--muted);";
+              let badgeText = "⏳ В очереди";
+              if (f.status === "done" || f.done_files >= f.total_files) {
+                badgeStyle = "background: rgba(35,134,54,0.2); color: #3fb950; border: 1px solid rgba(63,185,80,0.3);";
+                badgeText = "✅ 100% Завершено";
+              } else if (f.status === "active" || f.done_files > 0) {
+                badgeStyle = "background: rgba(255,107,74,0.2); color: var(--accent); border: 1px solid rgba(255,107,74,0.3);";
+                badgeText = `⬇️ ${pct}% Скачивается`;
+              }
+              const fillStyle = f.done_files >= f.total_files ? "background: #3fb950;" : "background: linear-gradient(90deg, #ff6b4a, #ffa756);";
+              return `
+                <div style="background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; display: flex; flex-direction: column; gap: 6px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                      <div style="font-size: 13px; font-weight: 600; color: var(--text-white);">${f.name}</div>
+                      <div style="font-size: 11px; color: var(--muted); margin-top: 2px;">${f.done_files} из ${f.total_files} файлов • ${f.done_gb} / ${f.total_gb} GB</div>
+                    </div>
+                    <span style="font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; ${badgeStyle}">${badgeText}</span>
+                  </div>
+                  <div style="width: 100%; height: 4px; background: #161b22; border-radius: 2px; overflow: hidden;">
+                    <div style="height: 100%; ${fillStyle} width: ${pct}%;"></div>
+                  </div>
+                </div>
+              `;
+            }).join("");
+          }
 
           const term = document.getElementById("termLogs");
           term.innerHTML = data.logs.join("\\n");
