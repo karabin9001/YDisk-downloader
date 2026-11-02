@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Yandex Turbo Downloader — Локальный веб-инструмент пакетного скачивания файлов с Яндекс.Диска.
-Работает на Mac и Windows, скачивает напрямую с CDN на максимальной скорости с автодокачкой.
+Работает на Mac и Windows, скачивает напрямую с CDN на максимальной скорости с автодокачкой,
+поддерживает кнопки Старт / Пауза / Стоп.
 """
 
 import os
@@ -37,6 +38,7 @@ PORT = 7860
 # Глобальное состояние загрузчика
 state = {
     "is_running": False,
+    "is_paused": False,
     "should_stop": False,
     "status_text": "Готов к работе",
     "current_file": "",
@@ -127,6 +129,7 @@ def get_download_link(public_key, path, token=None):
 def download_worker(urls: list, dest_dir: Path, token: str = None):
     with lock:
         state["is_running"] = True
+        state["is_paused"] = False
         state["should_stop"] = False
         state["status_text"] = "Сканирование ссылок на Яндекс Диске..."
         state["completed_list"] = []
@@ -177,6 +180,11 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
             add_log("⏹️ Загрузка остановлена пользователем.")
             break
 
+        while state["is_paused"]:
+            if state["should_stop"]:
+                break
+            time.sleep(0.3)
+
         dest = item['dest_path']
         expected_size = item['size']
 
@@ -211,6 +219,12 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
         for attempt in range(1, 5):
             if state["should_stop"]:
                 break
+
+            while state["is_paused"]:
+                if state["should_stop"]:
+                    break
+                time.sleep(0.3)
+
             try:
                 href = get_download_link(item['public_key'], item['remote_path'], token=token)
                 if not href:
@@ -239,6 +253,12 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
                         for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
                             if state["should_stop"]:
                                 break
+
+                            while state["is_paused"]:
+                                if state["should_stop"]:
+                                    break
+                                time.sleep(0.3)
+
                             if not chunk:
                                 continue
                             f.write(chunk)
@@ -289,6 +309,7 @@ def download_worker(urls: list, dest_dir: Path, token: str = None):
 
     with lock:
         state["is_running"] = False
+        state["is_paused"] = False
         state["status_text"] = "Загрузка завершена!" if not state["should_stop"] else "Загрузка остановлена"
         state["speed_str"] = "0 MB/s"
         state["eta_str"] = "--:--"
@@ -304,7 +325,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Yandex Turbo Downloader</title>
+  <title>YDisk Downloader</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -315,8 +336,12 @@ INDEX_HTML = """<!DOCTYPE html>
       --text: #c9d1d9;
       --text-white: #f0f6fc;
       --muted: #8b949e;
-      --green: #3fb950;
-      --red: #f85149;
+      --green: #238636;
+      --green-hover: #2ea043;
+      --yellow: #d29922;
+      --yellow-hover: #e3b341;
+      --red: #da3633;
+      --red-hover: #f85149;
       --blue: #58a6ff;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -347,9 +372,9 @@ INDEX_HTML = """<!DOCTYPE html>
     .toggle-section:hover { color: var(--text); }
     .hidden { display: none !important; }
 
-    .btn-row { display: flex; gap: 12px; }
+    .controls-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
     button {
-      padding: 12px 24px;
+      padding: 11px 22px;
       font-size: 14px;
       font-weight: 700;
       border: none;
@@ -360,11 +385,31 @@ INDEX_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 8px;
     }
-    .btn-primary { background: var(--accent); color: #fff; }
-    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); transform: translateY(-1px); }
+    button:disabled { opacity: 0.35; cursor: not-allowed; filter: grayscale(0.5); }
+    
+    .btn-start { background: var(--green); color: #fff; }
+    .btn-start:hover:not(:disabled) { background: var(--green-hover); transform: translateY(-1px); }
+    
+    .btn-pause { background: var(--yellow); color: #0d1117; }
+    .btn-pause:hover:not(:disabled) { background: var(--yellow-hover); transform: translateY(-1px); }
+    
     .btn-stop { background: var(--red); color: #fff; }
-    .btn-stop:hover:not(:disabled) { filter: brightness(1.1); }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-stop:hover:not(:disabled) { background: var(--red-hover); transform: translateY(-1px); }
+
+    .status-badge {
+      margin-left: auto;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 20px;
+      background: rgba(139,148,158,0.15);
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-badge.running { background: rgba(35,134,54,0.2); color: #3fb950; }
+    .status-badge.paused { background: rgba(210,153,34,0.2); color: #e3b341; }
 
     .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
     .stat-card { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center; }
@@ -377,14 +422,13 @@ INDEX_HTML = """<!DOCTYPE html>
     .progress-bar-fill { height: 100%; background: linear-gradient(90deg, #ff6b4a, #ffa756); width: 0%; transition: width 0.3s; }
 
     .terminal { background: #0a0d13; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--muted); max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
-    .log-line { margin-bottom: 2px; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>🚀 Yandex Turbo Downloader</h1>
-      <span class="badge">v1.0 Portable</span>
+      <h1>🚀 YDisk Downloader</h1>
+      <span class="badge">v1.1 Controls Edition</span>
     </div>
 
     <div class="card">
@@ -406,13 +450,25 @@ INDEX_HTML = """<!DOCTYPE html>
         <input type="text" id="tokenInput" placeholder="y0__wgB...">
       </div>
 
-      <div class="btn-row">
-        <button id="startBtn" class="btn-primary" onclick="startDownload()">
-          <span>🚀 Начать скачивание</span>
+      <div class="controls-row">
+        <!-- Кнопка Старт / Продолжить -->
+        <button id="startBtn" class="btn-start" onclick="startDownload()">
+          <span>▶️ Старт</span>
         </button>
+
+        <!-- Кнопка Пауза -->
+        <button id="pauseBtn" class="btn-pause" onclick="togglePause()" disabled>
+          <span id="pauseBtnText">⏸️ Пауза</span>
+        </button>
+
+        <!-- Кнопка Стоп -->
         <button id="stopBtn" class="btn-stop" onclick="stopDownload()" disabled>
-          <span>⏹ Остановить</span>
+          <span>⏹️ Стоп</span>
         </button>
+
+        <div id="statusBadge" class="status-badge">
+          <span>⚪ Готов</span>
+        </div>
       </div>
     </div>
 
@@ -452,7 +508,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <span id="overallPct">0%</span>
         </div>
         <div class="progress-bar-bg">
-          <div class="progress-bar-fill" id="overallProgressFill" style="background: linear-gradient(90deg, #3fb950, #58a6ff);"></div>
+          <div class="progress-bar-fill" id="overallProgressFill" style="background: linear-gradient(90deg, #238636, #58a6ff);"></div>
         </div>
       </div>
 
@@ -461,7 +517,8 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <script>
-    // Предзаполнение папки по умолчанию
+    let isCurrentlyPaused = false;
+
     document.addEventListener("DOMContentLoaded", () => {
       fetch("/api/default_dest")
         .then(r => r.json())
@@ -496,29 +553,71 @@ INDEX_HTML = """<!DOCTYPE html>
         body: JSON.stringify({ urls, dest, token })
       }).then(r => r.json()).then(res => {
         if (res.status === "started") {
-          document.getElementById("startBtn").disabled = true;
-          document.getElementById("stopBtn").disabled = false;
+          updateControlsState(true, false);
         } else {
           alert("Ошибка запуска: " + res.message);
         }
       });
     }
 
+    function togglePause() {
+      if (isCurrentlyPaused) {
+        fetch("/api/resume", { method: "POST" })
+          .then(r => r.json())
+          .then(() => {
+            isCurrentlyPaused = false;
+            updateControlsState(true, false);
+          });
+      } else {
+        fetch("/api/pause", { method: "POST" })
+          .then(r => r.json())
+          .then(() => {
+            isCurrentlyPaused = true;
+            updateControlsState(true, true);
+          });
+      }
+    }
+
     function stopDownload() {
       fetch("/api/stop", { method: "POST" })
         .then(r => r.json())
         .then(() => {
-          document.getElementById("startBtn").disabled = false;
-          document.getElementById("stopBtn").disabled = true;
+          updateControlsState(false, false);
         });
+    }
+
+    function updateControlsState(running, paused) {
+      const startBtn = document.getElementById("startBtn");
+      const pauseBtn = document.getElementById("pauseBtn");
+      const pauseText = document.getElementById("pauseBtnText");
+      const stopBtn = document.getElementById("stopBtn");
+      const badge = document.getElementById("statusBadge");
+
+      startBtn.disabled = running;
+      stopBtn.disabled = !running;
+      pauseBtn.disabled = !running;
+
+      if (!running) {
+        badge.className = "status-badge";
+        badge.innerHTML = "<span>⚪ Готов</span>";
+        pauseText.innerText = "⏸️ Пауза";
+      } else if (paused) {
+        badge.className = "status-badge paused";
+        badge.innerHTML = "<span>⏸️ На паузе</span>";
+        pauseText.innerText = "▶️ Продолжить";
+      } else {
+        badge.className = "status-badge running";
+        badge.innerHTML = "<span>🟢 Загрузка...</span>";
+        pauseText.innerText = "⏸️ Пауза";
+      }
     }
 
     function pollStatus() {
       fetch("/api/status")
         .then(r => r.json())
         .then(data => {
-          document.getElementById("startBtn").disabled = data.is_running;
-          document.getElementById("stopBtn").disabled = !data.is_running;
+          isCurrentlyPaused = data.is_paused;
+          updateControlsState(data.is_running, data.is_paused);
 
           document.getElementById("statFiles").innerText = `${data.completed_list.length} / ${data.total_files}`;
           document.getElementById("statSpeed").innerText = data.speed_str;
@@ -570,9 +669,17 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/api/start':
-            if state["is_running"]:
+            if state["is_running"] and not state["is_paused"]:
                 self._send_json({"status": "error", "message": "Загрузка уже идёт"}, 400)
                 return
+            if state["is_paused"]:
+                with lock:
+                    state["is_paused"] = False
+                    state["status_text"] = "Возобновление загрузки..."
+                add_log("▶️ Загрузка продолжена.")
+                self._send_json({"status": "started"})
+                return
+
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
             payload = json.loads(body.decode('utf-8'))
@@ -588,9 +695,27 @@ class RequestHandler(BaseHTTPRequestHandler):
             t.start()
             self._send_json({"status": "started"})
 
+        elif self.path == '/api/pause':
+            with lock:
+                state["is_paused"] = True
+                state["status_text"] = "Загрузка на паузе ⏸️"
+                state["speed_str"] = "0 MB/s"
+                state["eta_str"] = "Пауза"
+            add_log("⏸️ Загрузка поставлена на паузу.")
+            self._send_json({"status": "paused"})
+
+        elif self.path == '/api/resume':
+            with lock:
+                state["is_paused"] = False
+                state["status_text"] = "Загрузка продолжается ▶️"
+            add_log("▶️ Загрузка продолжена.")
+            self._send_json({"status": "resumed"})
+
         elif self.path == '/api/stop':
             with lock:
                 state["should_stop"] = True
+                state["is_paused"] = False
+            add_log("⏹️ Команда остановки получена.")
             self._send_json({"status": "stopping"})
         else:
             self.send_error(404)
@@ -599,7 +724,7 @@ def run_server():
     server = ThreadingHTTPServer((HOST, PORT), RequestHandler)
     url = f"http://{HOST}:{PORT}"
     print(f"\n========================================================")
-    print(f"🚀 Yandex Turbo Downloader запущен!")
+    print(f"🚀 YDisk Downloader запущен!")
     print(f"🌐 Откройте в браузере: {url}")
     print(f"========================================================\n")
     try:
