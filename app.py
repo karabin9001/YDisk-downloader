@@ -12,6 +12,7 @@ import io
 import time
 import json
 import threading
+import subprocess
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -154,6 +155,73 @@ def get_download_link(public_key, path, token=None):
     except ValueError:
         reason = ''
     raise Exception(f"Яндекс не выдал ссылку на файл (HTTP {r.status_code}). {reason}".strip())
+
+dialog_lock = threading.Lock()
+
+MAC_CHOOSE_FOLDER = """
+on run argv
+    set promptText to "Куда сохранить файлы с Яндекс Диска?"
+    tell application "System Events" to activate
+    if (count of argv) > 0 then
+        set p to choose folder with prompt promptText default location (POSIX file (item 1 of argv))
+    else
+        set p to choose folder with prompt promptText
+    end if
+    return POSIX path of p
+end run
+"""
+
+WIN_CHOOSE_FOLDER = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+$dlg.Description = 'Куда сохранить файлы с Яндекс Диска?'
+$dlg.ShowNewFolderButton = $true
+if ($env:YD_INITIAL_DIR -and (Test-Path -LiteralPath $env:YD_INITIAL_DIR)) { $dlg.SelectedPath = $env:YD_INITIAL_DIR }
+$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }
+if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.SelectedPath }
+$owner.Dispose()
+"""
+
+def choose_folder_dialog(initial: str = ''):
+    """Открывает системное окно выбора папки. Возвращает путь или None, если пользователь нажал «Отмена»."""
+    initial_dir = ''
+    if initial:
+        candidate = Path(initial).expanduser()
+        # Если папки ещё нет, начинаем с ближайшей существующей родительской
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        if candidate.is_dir():
+            initial_dir = str(candidate)
+
+    if sys.platform == 'darwin':
+        args = ['osascript', '-e', MAC_CHOOSE_FOLDER] + ([initial_dir] if initial_dir else [])
+        r = subprocess.run(args, capture_output=True, text=True, encoding='utf-8')
+        if r.returncode != 0:
+            if '-128' in r.stderr:  # «Отмена»
+                return None
+            raise Exception(r.stderr.strip() or 'osascript завершился с ошибкой')
+        return r.stdout.strip().rstrip('/') or '/'
+
+    if os.name == 'nt':
+        env = dict(os.environ, YD_INITIAL_DIR=initial_dir)
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', WIN_CHOOSE_FOLDER],
+            capture_output=True, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        out = r.stdout.decode('utf-8', errors='replace').strip().lstrip('﻿')
+        if r.returncode != 0 and not out:
+            raise Exception(r.stderr.decode('utf-8', errors='replace').strip() or 'PowerShell завершился с ошибкой')
+        return out or None
+
+    # Linux и прочие системы: пробуем tkinter
+    import tkinter
+    from tkinter import filedialog
+    root = tkinter.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    path = filedialog.askdirectory(initialdir=initial_dir or None, title='Куда сохранить файлы?')
+    root.destroy()
+    return path or None
 
 def wait_while_paused():
     while state["is_paused"] and not state["should_stop"]:
@@ -482,6 +550,11 @@ INDEX_HTML = """<!DOCTYPE html>
     }
     button:disabled { opacity: 0.35; cursor: not-allowed; filter: grayscale(0.5); }
     
+    .dest-row { display: flex; gap: 8px; }
+    .dest-row input { flex: 1; min-width: 0; }
+    .btn-choose { background: #21262d; color: var(--text-white); border: 1px solid var(--border); padding: 10px 16px; font-size: 13px; white-space: nowrap; }
+    .btn-choose:hover:not(:disabled) { border-color: var(--accent); }
+
     .btn-start { background: var(--green); color: #fff; }
     .btn-start:hover:not(:disabled) { background: var(--green-hover); transform: translateY(-1px); }
     
@@ -534,7 +607,10 @@ INDEX_HTML = """<!DOCTYPE html>
 
       <div class="field-group">
         <label>Куда сохранить на компьютере:</label>
-        <input type="text" id="destInput" value="">
+        <div class="dest-row">
+          <input type="text" id="destInput" value="">
+          <button type="button" id="chooseBtn" class="btn-choose" onclick="chooseFolder()">📁 Выбрать…</button>
+        </div>
       </div>
 
       <div class="toggle-section" onclick="toggleToken()">
@@ -640,6 +716,20 @@ INDEX_HTML = """<!DOCTYPE html>
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data || {})
       });
+    }
+
+    function chooseFolder() {
+      const btn = document.getElementById("chooseBtn");
+      const input = document.getElementById("destInput");
+      btn.disabled = true;
+      postJSON("/api/choose_folder", { current: input.value.trim() })
+        .then(r => r.json())
+        .then(res => {
+          if (res.status === "ok" && res.path) input.value = res.path;
+          else if (res.status === "error") alert(res.message + "\nПуть можно вписать вручную.");
+        })
+        .catch(() => alert("Не удалось открыть окно выбора папки. Путь можно вписать вручную."))
+        .finally(() => { btn.disabled = false; });
     }
 
     function toggleToken() {
@@ -908,6 +998,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                 state["is_paused"] = False
             add_log("⏹️ Команда остановки получена.")
             self._send_json({"status": "stopping"})
+
+        elif self.path == '/api/choose_folder':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                payload = json.loads(self.rfile.read(content_length).decode('utf-8') or '{}')
+            except (ValueError, UnicodeDecodeError):
+                payload = {}
+            # Второе окно поверх первого не открываем
+            if not dialog_lock.acquire(blocking=False):
+                self._send_json({"status": "error", "message": "Окно выбора папки уже открыто"}, 409)
+                return
+            try:
+                path = choose_folder_dialog(str(payload.get('current', '')))
+            except Exception as e:
+                self._send_json({"status": "error", "message": f"Не удалось открыть окно выбора папки: {e}"}, 500)
+                return
+            finally:
+                dialog_lock.release()
+            self._send_json({"status": "ok", "path": path})
         else:
             self.send_error(404)
 
