@@ -726,7 +726,7 @@ INDEX_HTML = """<!DOCTYPE html>
         .then(r => r.json())
         .then(res => {
           if (res.status === "ok" && res.path) input.value = res.path;
-          else if (res.status === "error") alert(res.message + "\nПуть можно вписать вручную.");
+          else if (res.status === "error") alert(res.message + "\\nПуть можно вписать вручную.");
         })
         .catch(() => alert("Не удалось открыть окно выбора папки. Путь можно вписать вручную."))
         .finally(() => { btn.disabled = false; });
