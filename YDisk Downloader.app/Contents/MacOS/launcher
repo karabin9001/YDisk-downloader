@@ -1,0 +1,76 @@
+#!/bin/bash
+# Запуск YDisk Downloader двойным кликом: без окна Терминала, сервер работает в фоне.
+# Приложение должно лежать в одной папке с app.py.
+
+URL="http://127.0.0.1:7860"
+APP_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+SUPPORT_DIR="$HOME/Library/Application Support/YDisk Downloader"
+VENV="$SUPPORT_DIR/venv"
+LOG="$HOME/Library/Logs/YDisk Downloader.log"
+
+alert() {
+    osascript -e 'on run argv' -e 'display alert "YDisk Downloader" message (item 1 of argv) as critical' -e 'end run' "$1" >/dev/null 2>&1
+}
+
+notify() {
+    osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "YDisk Downloader"' -e 'end run' "$1" >/dev/null 2>&1
+}
+
+# Уже запущен — просто открываем страницу
+if curl -s -o /dev/null --max-time 1 "$URL/"; then
+    open "$URL"
+    exit 0
+fi
+
+if [ ! -f "$APP_DIR/app.py" ]; then
+    alert "Не найден app.py рядом с приложением. Держите «YDisk Downloader.app» в папке программы. В Dock можно перетащить ярлык, а само приложение не перемещать."
+    exit 1
+fi
+
+# Из Finder PATH урезан, поэтому ищем Python сами. Системный /usr/bin/python3 — последним:
+# без Command Line Tools он только предлагает их установить.
+PYTHON=""
+for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+         /Library/Frameworks/Python.framework/Versions/Current/bin/python3 /usr/bin/python3; do
+    if [ -x "$p" ]; then
+        if [ "$p" = /usr/bin/python3 ] && ! xcode-select -p >/dev/null 2>&1; then
+            continue
+        fi
+        if "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+            PYTHON="$p"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    alert "Не найден Python 3.8 или новее. Установите его с python.org и запустите программу снова."
+    open "https://www.python.org/downloads/macos/"
+    exit 1
+fi
+
+# Своё окружение, чтобы не упираться в «externally-managed-environment» у Python из Homebrew
+mkdir -p "$SUPPORT_DIR" "$(dirname "$LOG")"
+if ! "$VENV/bin/python" -c 'import requests' 2>/dev/null; then
+    notify "Первый запуск: устанавливаю нужные компоненты…"
+    rm -rf "$VENV"
+    if ! "$PYTHON" -m venv "$VENV" >>"$LOG" 2>&1 || ! "$VENV/bin/python" -m pip install --quiet requests >>"$LOG" 2>&1; then
+        alert "Не удалось установить компоненты. Проверьте интернет и попробуйте снова. Подробности в журнале: ~/Library/Logs/YDisk Downloader.log"
+        exit 1
+    fi
+fi
+
+cd "$APP_DIR" || exit 1
+echo "=== Запуск $(date) ===" >>"$LOG"
+# Браузер открывает сам app.py, когда сервер готов
+nohup "$VENV/bin/python" -u app.py >>"$LOG" 2>&1 &
+
+# Ждём старта до 10 секунд, чтобы сообщить об ошибке, если сервер не поднялся
+for _ in $(seq 1 20); do
+    sleep 0.5
+    if curl -s -o /dev/null --max-time 1 "$URL/"; then
+        exit 0
+    fi
+done
+alert "Программа не запустилась. Подробности в журнале: ~/Library/Logs/YDisk Downloader.log"
+exit 1

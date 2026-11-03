@@ -552,6 +552,8 @@ INDEX_HTML = """<!DOCTYPE html>
     
     .dest-row { display: flex; gap: 8px; }
     .dest-row input { flex: 1; min-width: 0; }
+    .btn-quit { background: transparent; color: var(--muted); border: 1px solid var(--border); padding: 6px 12px; font-size: 12px; }
+    .btn-quit:hover { color: var(--red-hover); border-color: var(--red-hover); }
     .btn-choose { background: #21262d; color: var(--text-white); border: 1px solid var(--border); padding: 10px 16px; font-size: 13px; white-space: nowrap; }
     .btn-choose:hover:not(:disabled) { border-color: var(--accent); }
 
@@ -596,7 +598,10 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="container">
     <div class="header">
       <h1>🚀 YDisk Downloader</h1>
-      <span class="badge">v1.1 Controls Edition</span>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span class="badge">v1.2</span>
+        <button type="button" id="quitBtn" class="btn-quit" onclick="quitApp()" title="Остановить программу и закрыть сервер">⏻ Выключить</button>
+      </div>
     </div>
 
     <div class="card">
@@ -695,6 +700,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <script>
     let isCurrentlyPaused = false;
+    let pollTimer = null;
 
     // Имена файлов приходят из чужих папок — экранируем перед вставкой в HTML
     function esc(s) {
@@ -707,7 +713,7 @@ INDEX_HTML = """<!DOCTYPE html>
         .then(d => {
           if (d.path) document.getElementById("destInput").value = d.path;
         });
-      setInterval(pollStatus, 1000);
+      pollTimer = setInterval(pollStatus, 1000);
     });
 
     function postJSON(url, data) {
@@ -780,6 +786,18 @@ INDEX_HTML = """<!DOCTYPE html>
             updateControlsState(true, true);
           });
       }
+    }
+
+    function quitApp() {
+      const running = !document.getElementById("stopBtn").disabled;
+      const question = running
+        ? "Идёт загрузка. Выключить программу? Недокачанные файлы продолжат скачиваться при следующем запуске."
+        : "Выключить программу?";
+      if (!confirm(question)) return;
+      clearInterval(pollTimer);
+      postJSON("/api/shutdown").finally(() => {
+        document.body.innerHTML = '<div style="margin: 80px auto; text-align: center; color: #8b949e; font-size: 15px;">YDisk Downloader выключен. Вкладку можно закрыть.</div>';
+      });
     }
 
     function stopDownload() {
@@ -870,6 +888,12 @@ INDEX_HTML = """<!DOCTYPE html>
           const term = document.getElementById("termLogs");
           term.textContent = data.logs.join("\\n");
           term.scrollTop = term.scrollHeight;
+        })
+        .catch(() => {
+          // Сервер выключен или перезапускается
+          const badge = document.getElementById("statusBadge");
+          badge.className = "status-badge";
+          badge.innerHTML = "<span>🔌 Нет связи с программой</span>";
         });
     }
   </script>
@@ -999,6 +1023,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             add_log("⏹️ Команда остановки получена.")
             self._send_json({"status": "stopping"})
 
+        elif self.path == '/api/shutdown':
+            with lock:
+                state["should_stop"] = True
+                state["is_paused"] = False
+            add_log("⏻ Программа выключается.")
+            self._send_json({"status": "bye"})
+            # shutdown() ждёт конца serve_forever, поэтому зовём его из отдельного потока
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
         elif self.path == '/api/choose_folder':
             try:
                 content_length = int(self.headers.get('Content-Length', 0))
@@ -1035,7 +1068,9 @@ def run_server():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nОстановка сервера...")
+    finally:
         server.server_close()
+    print("👋 YDisk Downloader выключен.")
 
 if __name__ == '__main__':
     run_server()

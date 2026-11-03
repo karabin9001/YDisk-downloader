@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>YDisk Downloader</string>
+    <key>CFBundleDisplayName</key>
+    <string>YDisk Downloader</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.karabin9001.ydisk-downloader</string>
+    <key>CFBundleVersion</key>
+    <string>1.2</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>launcher</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.13</string>
+    <!-- Сервер работает в фоне, иконка в Доке не нужна -->
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
