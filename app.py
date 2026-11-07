@@ -57,7 +57,7 @@ BACKOFF_MAX = 120           # самая длинная пауза при обр
 FILE_HTTP_RETRIES = 6       # столько ошибок HTTP подряд, и файл уходит в конец очереди
 SCAN_HTTP_RETRIES = 8       # то же при сканировании ссылки
 DEFER_RETRY = 600           # через сколько вернуться к отложенному файлу, сек
-QUOTA_RETRY = 1800          # то же при дневном лимите Google, сек
+QUOTA_RETRY = 3600          # то же при дневном лимите Google, сек: каждая попытка тоже идёт в счёт лимита
 QUOTA_RETRY_MAX = 6 * 3600
 DEFER_GIVE_UP = 48 * 3600   # дольше не ждём: лимит Google снимается за сутки
 RESCAN_INTERVAL = 300       # как часто перепроверять папки, пока ждём отложенные файлы, сек
@@ -786,6 +786,7 @@ def mark_file_done(item, status):
     with lock:
         st["completed_list"].append({"name": item['dest_path'].name, "size": item['size'], "status": status})
         item['file']['status'] = 'done'
+        item['file']['quota'] = False
         item['file']['note'] = status
         fm = st["folders"][item['folder_idx']]
         fm['done_files'] += 1
@@ -817,6 +818,7 @@ def defer_item(item, reason, base_delay, max_delay):
     add_log(f"{file_label(item)} ⏳ {item['name']}: {reason}. Скачивание отклонено в {checked}. Отложен, повтор в {when}", q)
     with lock:
         item['file']['status'] = 'deferred'
+        item['file']['quota'] = bool(item.get('quota'))
         item['file']['note'] = f"{reason}: скачивание отклонено в {checked}, повтор в {when}"
         recount_folder(q.state["folders"][item['folder_idx']])
         q.deferred.append(item)
@@ -1147,6 +1149,9 @@ def run_queue(q):
         for f in new_files:
             size = f['size']
             entry = {"name": f['path'] or f['name'], "size": size or 0, "status": "queued", "note": f.get('note', '')}
+            if f.get('gdrive_id'):
+                # Страница файла в Google: оттуда можно сделать копию, когда файл упёрся в лимит
+                entry["url"] = GDRIVE_FILE_PAGE_URL.format(f['gdrive_id'])
             item = {
                 "queue": q,
                 "source": "gdrive" if f.get('gdrive_id') else "yandex",
@@ -1607,6 +1612,8 @@ INDEX_HTML = """<!DOCTYPE html>
     .notice { font-size: 12px; color: var(--muted); line-height: 1.4; }
     .notice.warn { color: var(--yellow); }
     .notice.bad { color: var(--red); }
+    a.ext { color: var(--blue); text-decoration: none; white-space: nowrap; }
+    a.ext:hover { text-decoration: underline; }
 
     details.sub { border-top: 1px solid var(--border); padding-top: 8px; }
     .queue details.sub { border-top: none; padding-top: 0; }
@@ -1622,13 +1629,13 @@ INDEX_HTML = """<!DOCTYPE html>
     .folder .bar { height: 4px; border: none; }
     details.files summary { cursor: pointer; font-size: 12px; color: var(--muted); }
     .file-rows { max-height: 220px; overflow-y: auto; margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
-    .file-row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 3px 6px; border-radius: 6px; }
+    .file-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 12px; padding: 3px 6px; border-radius: 6px; }
     .file-row.active { background: rgba(88,166,255,.1); }
     .file-row.done { color: var(--muted); }
     .file-row.deferred { color: var(--yellow); }
     .file-row.failed { color: var(--red); }
-    .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .file-info { color: var(--muted); white-space: nowrap; }
+    .file-name { flex: 1 0 35%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-info { color: var(--muted); text-align: right; }
     .terminal {
       margin-top: 8px; background: #0a0d13; border: 1px solid var(--border); border-radius: 10px; padding: 12px;
       font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--muted);
@@ -1739,7 +1746,7 @@ INDEX_HTML = """<!DOCTYPE html>
       waiting:     ["Ждёт своей очереди", "",     "Начнётся, когда освободится место. Число одновременных загрузок — в «Дополнительно»."],
       scanning:    ["Проверяю ссылку",     "run",  ""],
       downloading: ["Скачивается",         "run",  ""],
-      limit:       ["Ждёт лимита Google",  "warn", "Google временно закрыл файл: его скачивали слишком часто. Программа повторит попытку сама."],
+      limit:       ["Ждёт лимита Google",  "warn", "Google временно закрыл файл: его скачивали слишком часто. Лимит снимается примерно через сутки, программа повторит сама. Чтобы не ждать: откройте файл в Google под своим аккаунтом, нажмите «Файл → Создать копию» и вставьте ссылку на копию выше."],
       deferred:    ["Часть файлов отложена", "warn", "Некоторые файлы не отдались с первого раза. Программа вернётся к ним позже."],
       paused:      ["На паузе",            "warn", ""],
       stopping:    ["Останавливается",     "",     ""],
@@ -1760,7 +1767,9 @@ INDEX_HTML = """<!DOCTYPE html>
     function fileRow(f) {
       const labels = { queued: "в очереди", active: "⬇️ скачивается", done: "✅", deferred: "⏳ отложен", failed: "❌ ошибка" };
       const info = [labels[f.status] || f.status, f.note, formatSize(f.size)].filter(Boolean).join(" · ");
-      return `<div class="file-row ${esc(f.status)}"><span class="file-name">${esc(f.name)}</span><span class="file-info">${esc(info)}</span></div>`;
+      const link = f.url && (f.status === "deferred" || f.status === "failed")
+        ? ` <a class="ext" href="${esc(f.url)}" target="_blank" rel="noopener" title="Открыть страницу файла в Google">открыть в Google ↗</a>` : "";
+      return `<div class="file-row ${esc(f.status)}"><span class="file-name">${esc(f.name)}</span><span class="file-info">${esc(info)}${link}</span></div>`;
     }
 
     // Имена файлов приходят из чужих папок — экранируем перед вставкой в HTML
@@ -2003,6 +2012,14 @@ INDEX_HTML = """<!DOCTYPE html>
       if (q.notice) parts.push(q.notice);
       if (q.status_text && !["downloading", "done", "scanning", "paused"].includes(q.display) && !parts.includes(q.status_text)) parts.push(q.status_text);
       refs.notice.textContent = parts.join(" ");
+      if (q.display === "limit") {
+        // Первый файл с лимитом: кнопка, чтобы сразу открыть его и сделать копию
+        const quotaFiles = q.folders.flatMap(f => f.files).filter(x => x.quota && x.url);
+        if (quotaFiles.length) {
+          refs.notice.innerHTML = esc(parts.join(" ")) +
+            ` <a class="ext" href="${esc(quotaFiles[0].url)}" target="_blank" rel="noopener">Открыть ${quotaFiles.length > 1 ? "первый из " + quotaFiles.length + " файлов" : "файл"} в Google ↗</a>`;
+        }
+      }
       refs.notice.className = "notice " + (cls === "bad" || cls === "warn" ? cls : "");
       refs.notice.classList.toggle("hidden", !parts.length);
 
