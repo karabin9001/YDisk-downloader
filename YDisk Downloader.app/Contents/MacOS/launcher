@@ -51,10 +51,10 @@ fi
 
 # Своё окружение, чтобы не упираться в «externally-managed-environment» у Python из Homebrew
 mkdir -p "$SUPPORT_DIR" "$(dirname "$LOG")"
-if ! "$VENV/bin/python" -c 'import requests' 2>/dev/null; then
+if ! "$VENV/bin/python" -c 'import requests, socks' 2>/dev/null; then
     notify "Первый запуск: устанавливаю нужные компоненты…"
     rm -rf "$VENV"
-    if ! "$PYTHON" -m venv "$VENV" >>"$LOG" 2>&1 || ! "$VENV/bin/python" -m pip install --quiet requests >>"$LOG" 2>&1; then
+    if ! "$PYTHON" -m venv "$VENV" >>"$LOG" 2>&1 || ! "$VENV/bin/python" -m pip install --quiet requests PySocks >>"$LOG" 2>&1; then
         alert "Не удалось установить компоненты. Проверьте интернет и попробуйте снова. Подробности в журнале: ~/Library/Logs/YDisk Downloader.log"
         exit 1
     fi

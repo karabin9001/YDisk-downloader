@@ -16,10 +16,10 @@ if ! command -v python3 &> /dev/null; then
 fi
 
 # Проверка и установка requests при первом запуске
-python3 -c "import requests" 2>/dev/null
+python3 -c "import requests, socks" 2>/dev/null
 if [ $? -ne 0 ]; then
     echo "📦 Установка необходимого модуля requests (только при 1-м запуске)..."
-    python3 -m pip install requests --quiet
+    python3 -m pip install requests PySocks --quiet
 fi
 
 # Запуск приложения

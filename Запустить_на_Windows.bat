@@ -16,10 +16,10 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-python -c "import requests" >nul 2>nul
+python -c "import requests, socks" >nul 2>nul
 if %errorlevel% neq 0 (
     echo 📦 Установка необходимого модуля requests (только при 1-м запуске)...
-    python -m pip install requests --quiet
+    python -m pip install requests PySocks --quiet
 )
 
 python app.py
