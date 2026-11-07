@@ -1511,9 +1511,9 @@ INDEX_HTML = """<!DOCTYPE html>
     .version { font-size: 11px; color: var(--muted); }
 
     /* Карточки и формы */
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
-    .card-title { font-size: 17px; font-weight: 700; margin-bottom: 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .step { display: grid; grid-template-columns: 34px 1fr; gap: 12px; margin-bottom: 18px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+    .card-title { font-size: 16px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .step { display: grid; grid-template-columns: 34px 1fr; gap: 12px; margin-bottom: 14px; }
     .step-num {
       width: 30px; height: 30px; border-radius: 50%; background: var(--card-2); border: 1px solid var(--border);
       color: var(--text); font-weight: 700; font-size: 14px; display: grid; place-items: center; margin-top: 1px;
@@ -1529,7 +1529,7 @@ INDEX_HTML = """<!DOCTYPE html>
       font-family: inherit;
     }
     textarea:focus, input:focus, select:focus { border-color: var(--accent); }
-    textarea { resize: vertical; min-height: 74px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; }
+    textarea { resize: vertical; min-height: 58px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; }
     textarea.invalid, input.invalid { border-color: var(--red); }
     .dest-row { display: flex; gap: 8px; }
     .dest-row input { flex: 1; min-width: 0; }
@@ -1557,7 +1557,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     .submit-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 
-    details.advanced { border-top: 1px solid var(--border); margin-top: 20px; padding-top: 14px; }
+    details.advanced { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 12px; }
     details.advanced summary { cursor: pointer; color: var(--muted); font-size: 14px; list-style: none; display: flex; align-items: center; gap: 6px; }
     details.advanced summary::-webkit-details-marker { display: none; }
     details.advanced summary::before { content: "▸"; font-size: 12px; transition: transform .15s; }
@@ -1573,16 +1573,23 @@ INDEX_HTML = """<!DOCTYPE html>
     .summary { font-size: 13px; color: var(--muted); }
     .empty { text-align: center; color: var(--muted); padding: 36px 20px; border: 1px dashed var(--border); border-radius: 14px; font-size: 14px; }
 
-    .queue { display: flex; flex-direction: column; gap: 14px; border-left: 4px solid var(--border); }
+    .queue { display: flex; flex-direction: column; gap: 9px; padding: 14px 16px; border-left: 4px solid var(--border); }
     .queue.run { border-left-color: var(--green); }
     .queue.warn { border-left-color: var(--yellow); }
     .queue.bad { border-left-color: var(--red); }
     .queue.ok { border-left-color: var(--green); }
-    .q-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-    .q-title { font-size: 16px; font-weight: 700; word-break: break-word; }
-    .q-dest { font-size: 13px; color: var(--muted); margin-top: 3px; word-break: break-all; }
+    .q-head { display: flex; align-items: center; gap: 10px; }
+    .q-title { font-size: 15px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .q-dest { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .q-actions { display: flex; gap: 4px; flex: none; }
+    .q-actions button {
+      width: 30px; height: 30px; padding: 0; justify-content: center; font-size: 14px; border-radius: 8px;
+      background: transparent; color: var(--muted); border: 1px solid transparent;
+    }
+    .q-actions button:hover:not(:disabled) { background: var(--card-2); color: var(--text); border-color: var(--border); }
+    .q-actions button.danger:hover:not(:disabled) { color: var(--red); }
     .pill {
-      font-size: 13px; font-weight: 600; padding: 6px 12px; border-radius: 999px; white-space: nowrap; flex: none;
+      font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px; white-space: nowrap; flex: none;
       background: var(--card-2); color: var(--muted); border: 1px solid var(--border);
     }
     .pill.run { background: rgba(63,185,80,.14); color: var(--green); border-color: rgba(63,185,80,.3); }
@@ -1590,29 +1597,24 @@ INDEX_HTML = """<!DOCTYPE html>
     .pill.warn { background: rgba(227,179,65,.14); color: var(--yellow); border-color: rgba(227,179,65,.3); }
     .pill.bad { background: rgba(248,81,73,.12); color: var(--red); border-color: rgba(248,81,73,.3); }
 
-    .bar { width: 100%; height: 10px; background: var(--bg); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+    .bar { width: 100%; height: 6px; background: var(--bg); border-radius: 999px; overflow: hidden; }
     .bar > div { height: 100%; width: 0; border-radius: 999px; background: linear-gradient(90deg, var(--accent), #ffa756); transition: width .4s ease; }
     .queue.ok .bar > div { background: var(--green); }
-    .bar.thin { height: 5px; }
-    .bar.thin > div { background: var(--blue); }
-    .progress-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 14px; }
-    .progress-row .pct { font-size: 22px; font-weight: 700; }
-    .meta { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+    .meta { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 2px 6px; align-items: baseline; }
     .meta b { color: var(--text); font-weight: 600; }
-    .current { display: flex; flex-direction: column; gap: 6px; }
-    .current-line { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--muted); }
-    .current-line .name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .notice { font-size: 13px; padding: 10px 12px; border-radius: 10px; background: rgba(227,179,65,.1); color: var(--yellow); border: 1px solid rgba(227,179,65,.25); }
-    .notice.bad { background: rgba(248,81,73,.1); color: var(--red); border-color: rgba(248,81,73,.25); }
-    .notice.plain { background: var(--card-2); color: var(--muted); border-color: var(--border); }
-    .q-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .meta .pct { font-size: 15px; font-weight: 700; color: var(--text); margin-right: 4px; }
+    .current { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .notice { font-size: 12px; color: var(--muted); line-height: 1.4; }
+    .notice.warn { color: var(--yellow); }
+    .notice.bad { color: var(--red); }
 
-    details.sub { border-top: 1px solid var(--border); padding-top: 10px; }
+    details.sub { border-top: 1px solid var(--border); padding-top: 8px; }
+    .queue details.sub { border-top: none; padding-top: 0; }
     details.sub summary { cursor: pointer; font-size: 13px; color: var(--muted); list-style: none; }
     details.sub summary::-webkit-details-marker { display: none; }
     details.sub summary::before { content: "▸ "; font-size: 11px; }
     details.sub[open] summary::before { content: "▾ "; }
-    .folders { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+    .folders { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
     .folder { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
     .folder-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .folder-name { font-size: 14px; font-weight: 600; word-break: break-word; }
@@ -1634,7 +1636,6 @@ INDEX_HTML = """<!DOCTYPE html>
     }
     @media (max-width: 560px) {
       .card { padding: 16px; }
-      .progress-row .pct { font-size: 18px; }
       .dest-row { flex-direction: column; }
     }
   </style>
@@ -1867,39 +1868,29 @@ INDEX_HTML = """<!DOCTYPE html>
       el.className = "card queue";
       el.innerHTML = `
         <div class="q-head">
-          <div style="min-width: 0;">
-            <div class="q-title" data-ref="title"></div>
-            <div class="q-dest" data-ref="dest"></div>
-          </div>
+          <div class="q-title" data-ref="title"></div>
           <div class="pill" data-ref="badge"></div>
-        </div>
-        <div>
-          <div class="progress-row">
-            <span class="pct" data-ref="overallPct">0%</span>
-            <span class="meta" data-ref="meta"></span>
+          <div class="q-actions">
+            <button data-action="pause" title="Пауза">⏸</button>
+            <button data-action="resume" title="Продолжить">▶</button>
+            <button data-action="retry" title="Повторить отложенные файлы сейчас. Если лимит ещё действует, они останутся отложенными">🔁</button>
+            <button data-action="stop" class="danger" title="Стоп">⏹</button>
+            <button data-action="restart" title="Продолжить">▶</button>
+            <button data-action="remove" class="danger" title="Убрать из списка. Файлы на диске останутся">✕</button>
           </div>
-          <div class="bar" style="margin-top: 8px;"><div data-ref="overallFill"></div></div>
         </div>
-        <div class="current" data-ref="currentBox">
-          <div class="current-line"><span class="name" data-ref="current"></span><span data-ref="filePct"></span></div>
-          <div class="bar thin"><div data-ref="fileFill"></div></div>
-        </div>
+        <div class="bar"><div data-ref="overallFill"></div></div>
+        <div class="meta" data-ref="meta"></div>
+        <div class="current hidden" data-ref="current"></div>
         <div class="notice hidden" data-ref="notice"></div>
-        <div class="q-actions">
-          <button class="btn-yellow" data-action="pause">⏸️ Пауза</button>
-          <button class="btn-green" data-action="resume">▶️ Продолжить</button>
-          <button class="btn-secondary" data-action="retry" title="Сразу попробовать скачать отложенные файлы. Если лимит ещё действует, они останутся отложенными">🔁 Повторить отложенные</button>
-          <button class="btn-red" data-action="stop">⏹️ Стоп</button>
-          <button class="btn-green" data-action="restart">▶️ Продолжить</button>
-          <button class="btn-ghost" data-action="remove">✕ Убрать из списка</button>
-        </div>
         <details class="sub">
-          <summary data-ref="foldersSummary">Папки и файлы</summary>
+          <summary>Подробнее</summary>
+          <div class="q-dest" data-ref="dest" style="margin-top: 8px; white-space: normal; word-break: break-all;"></div>
           <div class="folders" data-ref="folders"></div>
-        </details>
-        <details class="sub">
-          <summary>Журнал этой загрузки</summary>
-          <div class="terminal" data-ref="log"></div>
+          <details class="sub" style="margin-top: 10px;">
+            <summary>Журнал этой загрузки</summary>
+            <div class="terminal" data-ref="log"></div>
+          </details>
         </details>`;
       const refs = { root: el, lastFolders: "", buttons: {} };
       el.querySelectorAll("[data-ref]").forEach(n => { refs[n.dataset.ref] = n; });
@@ -1956,7 +1947,6 @@ INDEX_HTML = """<!DOCTYPE html>
       refs.folders.querySelectorAll("details[open]").forEach(d => {
         d.querySelector(".file-rows").scrollTop = openLists.get(d.dataset.idx) || 0;
       });
-      refs.foldersSummary.textContent = q.folders.length ? `Папки и файлы (${q.folders.length})` : "Папки и файлы";
     }
 
     function renderQueue(q) {
@@ -1967,6 +1957,7 @@ INDEX_HTML = """<!DOCTYPE html>
       }
       const name = q.folders.length ? q.folders.map(f => f.name).join(", ") : q.urls[0];
       refs.title.textContent = name;
+      refs.title.title = name;
       refs.dest.textContent = "📁 " + q.dest + (q.urls.length > 1 ? ` · ссылок: ${q.urls.length}` : "");
 
       const [label, cls, explain] = STATUS[q.display] || [q.display, "", ""];
@@ -1982,13 +1973,12 @@ INDEX_HTML = """<!DOCTYPE html>
       b.retry.disabled = q.is_paused;
       b.stop.classList.toggle("hidden", !q.is_running || stopping);
       b.restart.classList.toggle("hidden", q.is_running || q.display === "done");
-      b.restart.textContent = q.display === "blocked" ? "🔄 Проверить папку" : "▶️ Продолжить";
+      b.restart.title = q.display === "blocked" ? "Проверить папку и продолжить" : "Продолжить";
       b.remove.classList.toggle("hidden", q.is_running);
 
-      // Главная строка: процент и факты одной строкой
-      refs.overallPct.textContent = `${q.overall_percent.toFixed(q.overall_percent >= 99.95 ? 0 : 1)}%`;
+      // Одна строка фактов под полосой
       refs.overallFill.style.width = `${q.overall_percent}%`;
-      const meta = [];
+      const meta = [`<span class="pct">${q.overall_percent.toFixed(q.overall_percent >= 99.95 ? 0 : 1)}%</span>`];
       if (q.total_files) meta.push(`<b>${q.completed_list.length}</b> из ${q.total_files} файлов`);
       if (q.total_bytes) {
         const unit = q.total_bytes >= 1024**3 ? 1024**3 : 1024**2;
@@ -2002,11 +1992,9 @@ INDEX_HTML = """<!DOCTYPE html>
       refs.meta.innerHTML = meta.join("<span style='opacity:.4'>·</span>");
 
       const hasCurrent = q.is_running && q.current_file && !q.is_paused;
-      refs.currentBox.classList.toggle("hidden", !hasCurrent);
+      refs.current.classList.toggle("hidden", !hasCurrent);
       if (hasCurrent) {
-        refs.current.textContent = (q.current_file_idx ? `${q.current_file_idx}. ` : "") + q.current_file;
-        refs.filePct.textContent = `${q.file_percent.toFixed(0)}%`;
-        refs.fileFill.style.width = `${q.file_percent}%`;
+        refs.current.textContent = `⬇ ${q.current_file} · ${q.file_percent.toFixed(0)}%`;
       }
 
       // Пояснение: что происходит и что делать. Технические детали сервера — только если они есть
@@ -2015,7 +2003,7 @@ INDEX_HTML = """<!DOCTYPE html>
       if (q.notice) parts.push(q.notice);
       if (q.status_text && !["downloading", "done", "scanning", "paused"].includes(q.display) && !parts.includes(q.status_text)) parts.push(q.status_text);
       refs.notice.textContent = parts.join(" ");
-      refs.notice.className = "notice " + (cls === "bad" ? "bad" : cls === "warn" ? "" : "plain");
+      refs.notice.className = "notice " + (cls === "bad" || cls === "warn" ? cls : "");
       refs.notice.classList.toggle("hidden", !parts.length);
 
       renderFolders(refs, q);
