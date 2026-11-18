@@ -249,6 +249,12 @@ API_BASE = 'https://cloud-api.yandex.net/v1/disk/public/resources'
 # Символы, которые нельзя использовать в именах файлов на Windows
 WIN_FORBIDDEN = '<>:"|?*'
 
+def yandex_get(url, **kwargs):
+    """Запрос к Яндексу всегда напрямую: системный прокси (HTTP_PROXY, туннель на сервере) его только тормозит."""
+    session = requests.Session()
+    session.trust_env = False
+    return session.get(url, **kwargs)
+
 def _auth_headers(token):
     return {'Authorization': f'OAuth {token.strip()}'} if token else {}
 
@@ -259,7 +265,7 @@ def get_public_resources(public_key, path='', token=None, offset=0, limit=100):
     last_error = None
     for attempt in range(3):
         try:
-            r = requests.get(API_BASE, params=params, headers=_auth_headers(token), timeout=25)
+            r = yandex_get(API_BASE, params=params, headers=_auth_headers(token), timeout=25)
             if r.status_code == 429 or r.status_code >= 500:
                 raise Exception(f"HTTP {r.status_code}")
             r.raise_for_status()
@@ -311,7 +317,7 @@ def get_download_link(public_key, path, token=None):
     params = {'public_key': public_key}
     if path:
         params['path'] = path
-    r = requests.get(f'{API_BASE}/download', params=params, headers=_auth_headers(token), timeout=25)
+    r = yandex_get(f'{API_BASE}/download', params=params, headers=_auth_headers(token), timeout=25)
     if r.status_code == 200:
         href = r.json().get('href')
         if href:
@@ -876,7 +882,7 @@ def open_stream(item, start_byte):
     # Ссылка CDN живёт недолго, поэтому берём новую на каждую попытку
     href = get_download_link(item['public_key'], item['remote_path'], token=q.token)
     headers = {'Range': f'bytes={start_byte}-'} if start_byte > 0 else {}
-    r = requests.get(href, headers=headers, stream=True, timeout=30)
+    r = yandex_get(href, headers=headers, stream=True, timeout=30)
     if r.status_code in (200, 206, 416):
         return r
     status = r.status_code

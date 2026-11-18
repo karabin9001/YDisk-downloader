@@ -281,6 +281,24 @@ class ScanTest(Base):
         finally:
             os.environ.pop('HTTPS_PROXY', None)
 
+    def test_yandex_download_ignores_system_proxy(self):
+        """Скачивание с Яндекса тоже идёт мимо HTTP_PROXY из окружения."""
+        seen = {}
+        real = requests.Session.request
+
+        def spy(session, method, url, **kwargs):
+            seen['trust_env'] = session.trust_env
+            raise requests.ConnectionError('сеть не трогаем')
+        requests.Session.request = spy
+        os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7897'
+        try:
+            with self.assertRaises(requests.ConnectionError):
+                app.yandex_get('https://cloud-api.yandex.net/v1/disk/public/resources', timeout=1)
+        finally:
+            requests.Session.request = real
+            os.environ.pop('HTTPS_PROXY', None)
+        self.assertFalse(seen['trust_env'])
+
     def test_server_token_from_env_file(self):
         env = self.tmp / '.env'
         env.write_text('﻿OTHER=1\nYANDEX_DISK_TOKEN="abc123"\n', encoding='utf-8')
