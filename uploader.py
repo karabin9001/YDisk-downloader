@@ -35,6 +35,7 @@ READ_BLOCK = 256 * 1024
 LIST_LIMIT = 1000
 SPEED_WINDOW = 15           # за сколько секунд считать скорость
 LOG_LIMIT = 300
+ORDER_MAX = 64              # пометка заказа: по ней Пульт показывает заливку в карточке заказа
 
 # Мусор macOS и Windows: на Диске он не нужен
 JUNK_NAMES = {'.DS_Store', '.localized', 'Thumbs.db', 'desktop.ini', 'Icon\r'}
@@ -156,6 +157,11 @@ def raise_for(r, what):
     if s in (408, 423, 429) or s >= 500:
         raise TransientError(detail, retry_after_seconds(r))
     raise FileError(detail)
+
+
+def clean_order(value):
+    """Пометка заказа — короткая строка без переводов строк. Пусто — без заказа."""
+    return ' '.join(str(value or '').split())[:ORDER_MAX]
 
 
 def format_eta(seconds):
@@ -338,8 +344,9 @@ def new_state():
 
 class UploadQueue:
     def __init__(self, sources, remote, threads=DEFAULT_THREADS, token=None, queue_id=None,
-                 paused=False, had_token=False, public_url=''):
+                 paused=False, had_token=False, public_url='', order=''):
         self.id = queue_id or secrets.token_hex(4)
+        self.order = clean_order(order)
         self.sources = list(sources)
         self.remote = remote
         self.threads = threads
@@ -436,7 +443,7 @@ class UploadQueue:
                           "чтобы не терять отправленное: прервать их можно кнопкой «Стоп».")
             data = {k: v for k, v in st.items() if k != 'failed'}
             data.update(
-                id=self.id, kind='upload', sources=self.sources, remote=self.remote, threads=self.threads,
+                id=self.id, kind='upload', order=self.order, sources=self.sources, remote=self.remote, threads=self.threads,
                 display=self.display_status(), active=active, pending_files=len(self.pending),
                 failed=st['failed'][-100:], failed_count=len(st['failed']),
                 progress_bytes=progress, notice=notice,
@@ -448,7 +455,7 @@ class UploadQueue:
             return data
 
     def session_entry(self):
-        return {'id': self.id, 'sources': self.sources, 'remote': self.remote, 'threads': self.threads,
+        return {'id': self.id, 'order': self.order, 'sources': self.sources, 'remote': self.remote, 'threads': self.threads,
                 'paused': self.state['is_paused'], 'had_token': self.had_token,
                 'public_url': self.state['public_url']}
 
@@ -760,7 +767,7 @@ def valid_threads(value):
     return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_THREADS
 
 
-def add(sources, remote, threads=DEFAULT_THREADS, token=None):
+def add(sources, remote, threads=DEFAULT_THREADS, token=None, order=''):
     """Новая очередь заливки. Возвращает (очередь, None) или (None, текст ошибки)."""
     sources = [str(Path(s).expanduser()) for s in sources if str(s).strip()]
     if not sources:
@@ -777,7 +784,7 @@ def add(sources, remote, threads=DEFAULT_THREADS, token=None):
     token = token or load_server_token()
     if not token:
         return None, 'Нужен токен Яндекс.Диска: впишите его в поле «Токен»'
-    q = UploadQueue(sources, remote, threads, token)
+    q = UploadQueue(sources, remote, threads, token, order=order)
     with ulock:
         for other in uploads:
             if other.state['is_running'] and other.remote == remote and set(other.sources) == set(sources):
@@ -901,7 +908,7 @@ def restore(entries, log=print):
         threads = e.get('threads') if valid_threads(e.get('threads')) else DEFAULT_THREADS
         q = UploadQueue(e['sources'], e['remote'], threads, server_token, queue_id=e.get('id'),
                         paused=bool(e.get('paused')), had_token=bool(e.get('had_token')),
-                        public_url=e.get('public_url') or '')
+                        public_url=e.get('public_url') or '', order=e.get('order') or '')
         restored.append(q)
     with ulock:
         uploads.extend(restored)

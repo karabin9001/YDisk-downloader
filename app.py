@@ -89,8 +89,10 @@ class PermanentError(Exception):
 class DownloadQueue:
     """Одна очередь: свои ссылки, папка, прогресс, журнал и кнопки. Качает в собственном потоке."""
 
-    def __init__(self, urls, dest, token=None, proxy='', flat=False, queue_id=None, paused=False, had_token=False):
+    def __init__(self, urls, dest, token=None, proxy='', flat=False, queue_id=None, paused=False, had_token=False,
+                 order=''):
         self.id = queue_id or secrets.token_hex(4)
+        self.order = uploader.clean_order(order)  # Заказ, к которому относится очередь: для Пульта
         self.urls = urls
         self.dest = Path(dest)
         self.token = token
@@ -186,12 +188,12 @@ class DownloadQueue:
     def snapshot(self):
         """Вызывать под lock. Токена и адреса прокси в ответе нет."""
         data = dict(self.state)
-        data.update(id=self.id, urls=self.urls, dest=str(self.dest), flat=self.flat, proxy_on=bool(self.proxy),
+        data.update(id=self.id, kind='download', order=self.order, urls=self.urls, dest=str(self.dest), flat=self.flat, proxy_on=bool(self.proxy),
                     has_slot=self.has_slot, display=self.display_status(), deferred_files=len(self.deferred))
         return data
 
     def session_entry(self):
-        return {"id": self.id, "urls": self.urls, "dest": str(self.dest), "proxy": self.proxy, "flat": self.flat,
+        return {"id": self.id, "order": self.order, "urls": self.urls, "dest": str(self.dest), "proxy": self.proxy, "flat": self.flat,
                 "paused": self.state["is_paused"], "had_token": self.had_token}
 
 def new_queue_state():
@@ -1369,9 +1371,9 @@ def duplicate_of(urls, dest, exclude=None):
             return q
     return None
 
-def add_queue(urls, dest, token=None, proxy='', flat=False):
+def add_queue(urls, dest, token=None, proxy='', flat=False, order=''):
     """Добавляет очередь и запускает её. None: такая очередь уже есть."""
-    q = DownloadQueue(urls, dest, token, proxy, flat)
+    q = DownloadQueue(urls, dest, token, proxy, flat, order=order)
     with lock:
         if duplicate_of(urls, dest):
             return None
@@ -1984,7 +1986,7 @@ INDEX_HTML = """<!DOCTYPE html>
       const shown = q.remote.replace(/^disk:/, "Диск:");
       refs.title.textContent = shown;
       refs.title.title = shown;
-      refs.src.textContent = "Откуда: " + q.sources.join(" · ");
+      refs.src.textContent = (q.order ? `Заказ ${q.order} · ` : "") + "Откуда: " + q.sources.join(" · ");
 
       const [label, cls, explain] = UP_STATUS[q.display] || [q.display, "", ""];
       refs.root.className = "card queue " + cls;
@@ -2286,7 +2288,7 @@ INDEX_HTML = """<!DOCTYPE html>
       const name = q.folders.length ? q.folders.map(f => f.name).join(", ") : q.urls[0];
       refs.title.textContent = name;
       refs.title.title = name;
-      refs.dest.textContent = "📁 " + q.dest + (q.urls.length > 1 ? ` · ссылок: ${q.urls.length}` : "");
+      refs.dest.textContent = (q.order ? `Заказ ${q.order} · ` : "") + "📁 " + q.dest + (q.urls.length > 1 ? ` · ссылок: ${q.urls.length}` : "");
 
       const [label, cls, explain] = STATUS[q.display] || [q.display, "", ""];
       refs.root.className = "card queue " + cls;
@@ -2545,7 +2547,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_error_json(f"Не удалось создать папку: {e}")
             return
 
-        q = add_queue(urls, dest_path, token, proxy, flat)
+        q = add_queue(urls, dest_path, token, proxy, flat, order=str(payload.get('order') or ''))
         if q is None:
             self._send_error_json("Эта ссылка уже качается в эту папку")
             return
@@ -2558,7 +2560,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         remote = str(payload.get('remote', '')).strip()
         threads = payload.get('threads', uploader.DEFAULT_THREADS)
         token = str(payload.get('token', '')).strip() or None
-        q, error = uploader.add(sources, remote, threads, token)
+        q, error = uploader.add(sources, remote, threads, token, order=str(payload.get('order') or ''))
         if error:
             self._send_error_json(error)
             return
@@ -2624,7 +2626,7 @@ def resume_unfinished():
         proxy = entry.get('proxy') or ''
         q = DownloadQueue(entry['urls'], entry['dest'], None, proxy, bool(entry.get('flat')),
                           queue_id=entry.get('id'), paused=bool(entry.get('paused')),
-                          had_token=bool(entry.get('had_token')))
+                          had_token=bool(entry.get('had_token')), order=entry.get('order') or '')
         problem = check_proxy(proxy)
         if not problem:
             try:
