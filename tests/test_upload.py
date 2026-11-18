@@ -618,6 +618,16 @@ class ApiTest(Base):
         self.assertEqual(res['status'], 'error')
         self.assertIn('токен', res['message'])
 
+    def test_no_folder_dialog_in_network_mode(self):
+        real = app.LOCAL_ONLY
+        app.LOCAL_ONLY = False
+        try:
+            res = self.post('/api/choose_folder', current='', purpose='upload')
+        finally:
+            app.LOCAL_ONLY = real
+        self.assertEqual(res['status'], 'error')
+        self.assertIn('сервере', res['message'])
+
     def test_page_has_upload_tab(self):
         page = self.http.get(self.base + '/', timeout=5).text
         self.assertIn('Залить на Яндекс Диск', page)

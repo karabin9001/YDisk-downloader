@@ -55,6 +55,8 @@ import uploader  # Заливка на Яндекс.Диск
 HOST = os.environ.get('YDISK_HOST') or "127.0.0.1"
 PORT = int(os.environ.get('YDISK_PORT') or 7860)  # Другой порт нужен только для проверок
 OPEN_BROWSER = not os.environ.get('YDISK_NO_BROWSER')
+# Страницу открывают с другого компьютера: окно выбора папки открылось бы на сервере, где его никто не видит
+LOCAL_ONLY = HOST in ('127.0.0.1', 'localhost')
 
 CHUNK_SIZE = 2 * 1024 * 1024
 BACKOFF_BASE = 2            # первая пауза перед повтором, сек
@@ -2503,6 +2505,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "bye"})
             # shutdown() ждёт конца serve_forever, поэтому зовём его из отдельного потока
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+        elif self.path == '/api/choose_folder' and not LOCAL_ONLY:
+            self._send_error_json("Программа работает на сервере: окно выбора папки там никто не увидит.")
         elif self.path == '/api/choose_folder':
             # Второе окно поверх первого не открываем
             if not dialog_lock.acquire(blocking=False):
