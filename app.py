@@ -48,8 +48,13 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-HOST = "127.0.0.1"
+import uploader  # Заливка на Яндекс.Диск
+
+# По умолчанию программа видна только с этого компьютера. На домашнем сервере можно открыть её для
+# локальной сети: YDISK_HOST=0.0.0.0 и YDISK_ALLOWED_HOSTS=192.168.1.77:7860 (адреса, по которым её открывают)
+HOST = os.environ.get('YDISK_HOST') or "127.0.0.1"
 PORT = int(os.environ.get('YDISK_PORT') or 7860)  # Другой порт нужен только для проверок
+OPEN_BROWSER = not os.environ.get('YDISK_NO_BROWSER')
 
 CHUNK_SIZE = 2 * 1024 * 1024
 BACKOFF_BASE = 2            # первая пауза перед повтором, сек
@@ -662,7 +667,7 @@ if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write
 $owner.Dispose()
 """
 
-def choose_folder_dialog(initial: str = ''):
+def choose_folder_dialog(initial: str = '', prompt: str = 'Куда сохранить файлы?'):
     """Открывает системное окно выбора папки. Возвращает путь или None, если пользователь нажал «Отмена»."""
     initial_dir = ''
     if initial:
@@ -674,7 +679,8 @@ def choose_folder_dialog(initial: str = ''):
             initial_dir = str(candidate)
 
     if sys.platform == 'darwin':
-        args = ['osascript', '-e', MAC_CHOOSE_FOLDER] + ([initial_dir] if initial_dir else [])
+        script = MAC_CHOOSE_FOLDER.replace('Куда сохранить файлы?', prompt)
+        args = ['osascript', '-e', script] + ([initial_dir] if initial_dir else [])
         r = subprocess.run(args, capture_output=True, text=True, encoding='utf-8')
         if r.returncode != 0:
             if '-128' in r.stderr:  # «Отмена»
@@ -685,7 +691,8 @@ def choose_folder_dialog(initial: str = ''):
     if os.name == 'nt':
         env = dict(os.environ, YD_INITIAL_DIR=initial_dir)
         r = subprocess.run(
-            ['powershell', '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', WIN_CHOOSE_FOLDER],
+            ['powershell', '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command',
+             WIN_CHOOSE_FOLDER.replace('Куда сохранить файлы?', prompt)],
             capture_output=True, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         out = r.stdout.decode('utf-8', errors='replace').strip().lstrip('﻿')
         if r.returncode != 0 and not out:
@@ -698,7 +705,7 @@ def choose_folder_dialog(initial: str = ''):
     root = tkinter.Tk()
     root.withdraw()
     root.attributes('-topmost', True)
-    path = filedialog.askdirectory(initialdir=initial_dir or None, title='Куда сохранить файлы?')
+    path = filedialog.askdirectory(initialdir=initial_dir or None, title=prompt)
     root.destroy()
     return path or None
 
@@ -1460,6 +1467,7 @@ def set_max_active(value):
 
 def stop_all_for_quit():
     """Выключение программы: незавершённые очереди остаются в session.json."""
+    uploader.stop_all_for_quit()
     with slot_changed:
         app_state["quitting"] = True
         for q in queues:
@@ -1641,6 +1649,19 @@ INDEX_HTML = """<!DOCTYPE html>
       font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--muted);
       max-height: 220px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
     }
+    /* Вкладки и заливка */
+    .tabs { display: flex; gap: 6px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 4px; }
+    .tabs button { flex: 1; justify-content: center; background: transparent; color: var(--muted); padding: 9px 12px; }
+    .tabs button.on { background: var(--card-2); color: var(--text); border: 1px solid var(--border); }
+    .token-ok { font-size: 13px; color: var(--green); }
+    .up-files { display: flex; flex-direction: column; gap: 4px; }
+    .up-file { font-size: 12px; color: var(--muted); display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; }
+    .up-file .file-name { color: var(--text); }
+    .up-file .bar { grid-column: 1 / -1; height: 3px; }
+    .link-row { display: flex; gap: 8px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+    .link-row input { flex: 1; min-width: 200px; padding: 7px 10px; font-size: 13px; }
+    .inline-select { width: auto !important; padding: 4px 8px !important; font-size: 13px !important; border-radius: 8px !important; }
+
     @media (max-width: 560px) {
       .card { padding: 16px; }
       .dest-row { flex-direction: column; }
@@ -1654,16 +1675,73 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="brand-icon">⬇</div>
         <div>
           <h1>YDisk Downloader</h1>
-          <p>Скачивает папки с Яндекс Диска и Google Drive целиком</p>
+          <p>Скачивает папки с Яндекс Диска и Google Drive целиком и заливает на Яндекс Диск</p>
         </div>
       </div>
       <div class="header-right">
-        <span class="version">v1.5</span>
+        <span class="version">v1.6</span>
         <button type="button" id="quitBtn" class="btn-ghost danger" onclick="quitApp()" title="Остановить программу. Незавершённые загрузки продолжатся при следующем запуске">⏻ Выключить</button>
       </div>
     </div>
 
-    <div class="card">
+    <div class="tabs">
+      <button type="button" id="tabDl" class="on" onclick="showTab('dl')">⬇️ Скачать</button>
+      <button type="button" id="tabUp" onclick="showTab('up')">⬆️ Залить на Яндекс Диск</button>
+    </div>
+
+    <div class="card hidden" id="upCard">
+      <div class="card-title">Новая заливка на Яндекс Диск</div>
+
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <div class="step-label">Что залить</div>
+          <textarea id="upSourcesInput" placeholder="/Volumes/SSD/Проект/Исходники&#10;E:&#92;Заказ&#92;Рендер.mp4"></textarea>
+          <div class="dest-row"><button type="button" id="upChooseBtn" class="btn-secondary" onclick="chooseUploadFolder()">📁 Добавить папку…</button></div>
+          <div class="hint">Папки и файлы на этом компьютере, каждый путь с новой строки. Папка ляжет на Диск подпапкой со своим именем. Служебные файлы macOS (._*, .DS_Store) не заливаются.</div>
+          <div class="error-text hidden" id="upSourcesError"></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <div class="step-label">Куда на Диске</div>
+          <input type="text" id="upRemoteInput" placeholder="Заливка/Проект" spellcheck="false">
+          <div class="hint">Папка на Яндекс Диске, она создастся сама. Файлы, которые там уже есть с тем же размером, пропустятся. В конце программа опубликует папку и покажет ссылку.</div>
+          <div class="error-text hidden" id="upRemoteError"></div>
+        </div>
+      </div>
+
+      <div class="step" style="margin-bottom: 0;">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <div class="submit-row">
+            <button id="upStartBtn" class="btn-primary" onclick="startUpload()">⬆️ Залить</button>
+            <span class="hint" id="upTokenState"></span>
+          </div>
+        </div>
+      </div>
+
+      <details class="advanced">
+        <summary>Дополнительно: токен Диска, число потоков, про скорость</summary>
+        <div class="advanced-body">
+          <div class="field">
+            <label for="upTokenInput">Токен Яндекс Диска</label>
+            <input type="password" id="upTokenInput" placeholder="y0__wgB…" autocomplete="off">
+            <div class="hint">Нужен доступ на запись. Хранится только в памяти программы, на диск не пишется. Если на сервере токен уже задан, поле можно оставить пустым.</div>
+          </div>
+          <div class="field">
+            <label for="upThreads">Сколько файлов заливать одновременно</label>
+            <select id="upThreads"></select>
+            <div class="hint">Яндекс ограничивает каждое соединение, но параллельные файлы складываются: 16 потоков упираются в канал 100 Мбит/с.</div>
+          </div>
+          <div class="hint">⚠️ Один большой файл ускорить нельзя: Яндекс принимает его одним соединением (около 1 Мбит/с по замерам), а заливку частями его API не поддерживает. Поэтому крупные файлы начинаются первыми.</div>
+        </div>
+      </details>
+    </div>
+
+    <div class="card" id="dlCard">
       <div class="card-title">Новая загрузка</div>
 
       <div class="step">
@@ -1728,6 +1806,12 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="queuesList" style="display: flex; flex-direction: column; gap: 16px;"></div>
     <div id="emptyNote" class="empty">Здесь появятся ваши загрузки.<br>Вставьте ссылку выше и нажмите «Скачать».</div>
 
+    <div class="section-head hidden" id="upHead">
+      <h2>Заливки на Яндекс Диск</h2>
+      <span class="summary" id="upSummary"></span>
+    </div>
+    <div id="uploadsList" style="display: flex; flex-direction: column; gap: 16px;"></div>
+
     <div class="card hidden" id="appLogCard">
       <details class="sub" open>
         <summary>Журнал программы</summary>
@@ -1759,6 +1843,221 @@ INDEX_HTML = """<!DOCTYPE html>
     const ICON = { waiting: "⏳", scanning: "🔍", downloading: "⬇️", limit: "⏳", deferred: "⏳", paused: "⏸️",
                    stopping: "⏹️", stopped: "⏹️", done: "✅", problems: "⚠️", crashed: "❌", blocked: "🔌" };
 
+    const upCards = new Map();  // id заливки → элементы её карточки
+    const UP_STATUS = {
+      waiting:    ["Ждёт запуска",          "",     ""],
+      scanning:   ["Смотрю файлы",          "run",  ""],
+      checking:   ["Сверяю с Диском",       "run",  ""],
+      uploading:  ["Заливается",            "run",  ""],
+      publishing: ["Публикую папку",        "run",  ""],
+      paused:     ["На паузе",              "warn", ""],
+      stopping:   ["Останавливается",       "",     ""],
+      stopped:    ["Остановлена",           "",     "Нажмите «Продолжить»: уже залитое пропустится, остальное дольётся."],
+      done:       ["Готово",                "ok",   ""],
+      problems:   ["Готово, но с ошибками", "bad",  ""],
+      crashed:    ["Сбой программы",        "bad",  ""],
+      blocked:    ["Не продолжена",         "bad",  ""],
+    };
+    const UP_ICON = { waiting: "⏳", scanning: "🔍", checking: "🔍", uploading: "⬆️", publishing: "🔗", paused: "⏸️",
+                      stopping: "⏹️", stopped: "⏹️", done: "✅", problems: "⚠️", crashed: "❌", blocked: "🔌" };
+
+    function showTab(name) {
+      document.getElementById("dlCard").classList.toggle("hidden", name !== "dl");
+      document.getElementById("upCard").classList.toggle("hidden", name !== "up");
+      document.getElementById("tabDl").classList.toggle("on", name === "dl");
+      document.getElementById("tabUp").classList.toggle("on", name === "up");
+      try { localStorage.setItem("ydTab", name); } catch (e) {}
+    }
+
+    function chooseUploadFolder() {
+      const btn = document.getElementById("upChooseBtn");
+      const input = document.getElementById("upSourcesInput");
+      btn.disabled = true;
+      const lines = input.value.split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
+      postJSON("/api/choose_folder", { current: lines.length ? lines[lines.length - 1] : "", purpose: "upload" })
+        .then(r => r.json())
+        .then(res => {
+          if (res.status === "ok" && res.path) {
+            if (!lines.includes(res.path)) lines.push(res.path);
+            input.value = lines.join(String.fromCharCode(10));
+            showError("upSourcesInput", "");
+          } else if (res.status === "error") showError("upSourcesInput", res.message + " Путь можно вписать вручную.");
+        })
+        .catch(() => showError("upSourcesInput", "Не удалось открыть окно выбора папки. Путь можно вписать вручную."))
+        .finally(() => { btn.disabled = false; });
+    }
+
+    function startUpload() {
+      const srcInput = document.getElementById("upSourcesInput");
+      const sources = srcInput.value.split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
+      const remote = document.getElementById("upRemoteInput").value.trim();
+      const token = document.getElementById("upTokenInput").value.trim();
+      const threads = Number(document.getElementById("upThreads").value);
+      let ok = true;
+      if (!sources.length) { showError("upSourcesInput", "Укажите хотя бы одну папку или файл."); ok = false; }
+      if (!remote) { showError("upRemoteInput", "Укажите папку на Диске, например Заливка/Проект."); ok = false; }
+      if (!ok) return;
+      const btn = document.getElementById("upStartBtn");
+      btn.disabled = true;
+      postJSON("/api/upload/start", { sources, remote, token, threads }).then(r => r.json()).then(res => {
+        if (res.status === "started") { srcInput.value = ""; pollStatus(); }
+        else showError("upSourcesInput", "Не получилось начать: " + res.message);
+      }).catch(() => showError("upSourcesInput", "Нет связи с программой. Запущена ли она?"))
+        .finally(() => { btn.disabled = false; });
+    }
+
+    function uploadAction(id, action, extra) {
+      const token = document.getElementById("upTokenInput").value.trim();
+      postJSON("/api/upload/" + action, Object.assign({ id, token }, extra || {}))
+        .then(r => r.json())
+        .then(res => { if (res.status === "error") alert(res.message); pollStatus(); });
+    }
+
+    function createUploadCard(id) {
+      const el = document.createElement("div");
+      el.className = "card queue";
+      el.innerHTML = `
+        <div class="q-head">
+          <div class="q-title" data-ref="title"></div>
+          <div class="pill" data-ref="badge"></div>
+          <div class="q-actions">
+            <button data-action="top" title="Поднять наверх: эта заливка продолжается, остальные идущие — на паузу">⤒</button>
+            <button data-action="pause" title="Пауза: новые файлы не начинаются, начатые догружаются">⏸</button>
+            <button data-action="resume" title="Продолжить">▶</button>
+            <button data-action="stop" class="danger" title="Стоп: начатые файлы обрываются">⏹</button>
+            <button data-action="restart" title="Продолжить: залитое пропустится">▶</button>
+            <button data-action="remove" class="danger" title="Убрать из списка. На Диске всё останется">✕</button>
+          </div>
+        </div>
+        <div class="bar"><div data-ref="fill"></div></div>
+        <div class="meta" data-ref="meta"></div>
+        <div class="up-files" data-ref="active"></div>
+        <div class="notice hidden" data-ref="notice"></div>
+        <div class="link-row hidden" data-ref="link">🔗 <input type="text" readonly data-ref="linkInput"><button type="button" class="btn-ghost" data-ref="copy">Копировать</button><a class="ext" target="_blank" rel="noopener" data-ref="open">открыть ↗</a></div>
+        <details class="sub">
+          <summary>Подробнее</summary>
+          <div class="q-dest" data-ref="src" style="margin-top: 8px; white-space: normal; word-break: break-all;"></div>
+          <div class="link-row" style="margin-top: 8px;">Потоков: <select class="inline-select" data-ref="threads"></select></div>
+          <details class="sub hidden" style="margin-top: 10px;" data-ref="failedBox">
+            <summary data-ref="failedSum"></summary>
+            <div class="file-rows" data-ref="failed"></div>
+          </details>
+          <details class="sub" style="margin-top: 10px;">
+            <summary>Журнал этой заливки</summary>
+            <div class="terminal" data-ref="log"></div>
+          </details>
+        </details>`;
+      const refs = { root: el, buttons: {}, lastFailed: "" };
+      el.querySelectorAll("[data-ref]").forEach(n => { refs[n.dataset.ref] = n; });
+      el.querySelectorAll("[data-action]").forEach(btn => {
+        refs.buttons[btn.dataset.action] = btn;
+        btn.addEventListener("click", () => {
+          if (btn.dataset.action === "stop" && !confirm("Остановить заливку? Начатые файлы оборвутся и при «Продолжить» начнутся заново. Залитое останется на Диске.")) return;
+          uploadAction(id, btn.dataset.action);
+        });
+      });
+      for (let i = 1; i <= upMaxThreads; i++) refs.threads.add(new Option(String(i), String(i)));
+      refs.threads.addEventListener("change", () => uploadAction(id, "threads", { threads: Number(refs.threads.value) }));
+      refs.copy.addEventListener("click", () => {
+        refs.linkInput.select();
+        if (navigator.clipboard) navigator.clipboard.writeText(refs.linkInput.value).catch(() => document.execCommand("copy"));
+        else document.execCommand("copy");
+        refs.copy.textContent = "Скопировано";
+        setTimeout(() => { refs.copy.textContent = "Копировать"; }, 1500);
+      });
+      document.getElementById("uploadsList").appendChild(el);
+      return refs;
+    }
+
+    function renderUpload(q, index) {
+      let refs = upCards.get(q.id);
+      if (!refs) { refs = createUploadCard(q.id); upCards.set(q.id, refs); }
+      document.getElementById("uploadsList").appendChild(refs.root);  // Порядок карточек = приоритет
+      const shown = q.remote.replace(/^disk:/, "Диск:");
+      refs.title.textContent = shown;
+      refs.title.title = shown;
+      refs.src.textContent = "Откуда: " + q.sources.join(" · ");
+
+      const [label, cls, explain] = UP_STATUS[q.display] || [q.display, "", ""];
+      refs.root.className = "card queue " + cls;
+      refs.badge.className = "pill " + cls;
+      refs.badge.textContent = `${UP_ICON[q.display] || ""} ${label}`.trim();
+
+      const b = refs.buttons;
+      const stopping = q.display === "stopping";
+      b.top.classList.toggle("hidden", !q.is_running || stopping || index === 0);
+      b.pause.classList.toggle("hidden", !q.is_running || q.is_paused || stopping);
+      b.resume.classList.toggle("hidden", !q.is_running || !q.is_paused || stopping);
+      b.stop.classList.toggle("hidden", !q.is_running || stopping);
+      b.restart.classList.toggle("hidden", q.is_running || q.display === "done");
+      b.remove.classList.toggle("hidden", q.is_running);
+      if (document.activeElement !== refs.threads) refs.threads.value = String(q.threads);
+
+      refs.fill.style.width = `${q.overall_percent}%`;
+      const gb = x => (x / 1024**3).toFixed(x >= 10 * 1024**3 ? 0 : 2);
+      const meta = [`<span class="pct">${q.overall_percent.toFixed(q.overall_percent >= 99.95 ? 0 : 1)}%</span>`];
+      if (q.total_files) meta.push(`<b>${q.done_files + q.skipped_files}</b> из ${q.total_files} файлов`);
+      if (q.total_bytes) meta.push(`<b>${gb(q.progress_bytes)}</b> из ${gb(q.total_bytes)} ГБ`);
+      if (q.skipped_files) meta.push(`уже были на Диске: ${q.skipped_files}`);
+      if (q.failed_count) meta.push(`<span style="color: var(--red)">ошибок: ${q.failed_count}</span>`);
+      if (q.display === "uploading" && q.speed_str) {
+        meta.push(`<b>${esc(q.speed_str)}</b>`);
+        if (q.eta_str && q.eta_str !== "--:--") meta.push(`осталось <b>${esc(q.eta_str)}</b>`);
+      }
+      if (q.display === "uploading") meta.push(`потоков: ${q.active.length} из ${q.threads}`);
+      refs.meta.innerHTML = meta.join("<span style='opacity:.4'>·</span>");
+
+      // Начатые файлы: крупные сверху, у каждого своя скорость — видно, что один файл быстрее не пойдёт
+      const act = q.active.slice(0, 6);
+      refs.active.innerHTML = act.map(f => `
+        <div class="up-file"><span class="file-name">⬆ ${esc(f.name)}</span>
+          <span>${f.percent.toFixed(0)}% из ${esc(formatSize(f.size))}${f.speed_str ? " · " + esc(f.speed_str) : ""}</span>
+          <div class="bar"><div style="width: ${f.percent}%"></div></div></div>`).join("") +
+        (q.active.length > act.length ? `<div class="hint">и ещё ${q.active.length - act.length} файлов заливаются…</div>` : "");
+
+      const parts = [];
+      if (explain) parts.push(explain);
+      if (q.notice) parts.push(q.notice);
+      if (q.status_text && ["problems", "crashed", "blocked"].includes(q.display)) parts.push(q.status_text);
+      refs.notice.textContent = parts.join(" ");
+      refs.notice.className = "notice " + (cls === "bad" || cls === "warn" ? cls : "");
+      refs.notice.classList.toggle("hidden", !parts.length);
+
+      refs.link.classList.toggle("hidden", !q.public_url);
+      if (q.public_url && refs.linkInput.value !== q.public_url) {
+        refs.linkInput.value = q.public_url;
+        refs.open.href = q.public_url;
+      }
+
+      const failedKey = JSON.stringify(q.failed);
+      if (failedKey !== refs.lastFailed) {
+        refs.lastFailed = failedKey;
+        refs.failedBox.classList.toggle("hidden", !q.failed_count);
+        refs.failedSum.textContent = `Не залились (${q.failed_count})`;
+        refs.failed.innerHTML = q.failed.map(f => `<div class="file-row failed"><span class="file-name">${esc(f.name.replace(/^disk:/, ""))}</span><span class="file-info">${esc(f.error)}</span></div>`).join("");
+      }
+      const text = q.logs.join(String.fromCharCode(10));
+      if (refs.log.textContent !== text) { refs.log.textContent = text; refs.log.scrollTop = refs.log.scrollHeight; }
+    }
+
+    function renderUploads(list) {
+      const alive = new Set(list.map(q => q.id));
+      upCards.forEach((refs, id) => { if (!alive.has(id)) { refs.root.remove(); upCards.delete(id); } });
+      list.forEach(renderUpload);
+      document.getElementById("upHead").classList.toggle("hidden", !list.length);
+      const running = list.filter(q => q.display === "uploading");
+      const speed = running.reduce((a, q) => a + (q.speed_bps || 0), 0);
+      const parts = [];
+      if (running.length) parts.push(`заливается: ${running.length}` + (speed ? ` · ${(speed * 8 / 1e6).toFixed(1)} Мбит/с` : ""));
+      const paused = list.filter(q => q.display === "paused").length;
+      if (paused) parts.push(`на паузе: ${paused}`);
+      const done = list.filter(q => q.display === "done").length;
+      if (done) parts.push(`готово: ${done}`);
+      document.getElementById("upSummary").textContent = parts.join(" · ");
+    }
+
+    let upMaxThreads = 32;
+
     function formatSize(bytes) {
       if (!bytes) return "";
       return bytes >= 1024**3 ? `${(bytes / 1024**3).toFixed(2)} ГБ` : `${(bytes / 1024**2).toFixed(1)} МБ`;
@@ -1784,7 +2083,19 @@ INDEX_HTML = """<!DOCTYPE html>
           if (d.path) document.getElementById("destInput").value = d.path;
           document.getElementById("proxyInput").value = d.proxy || "";
           document.getElementById("flatInput").checked = !!d.flat;
+          upMaxThreads = d.upload_max_threads || 32;
+          const sel = document.getElementById("upThreads");
+          for (let i = 1; i <= upMaxThreads; i++) sel.add(new Option(String(i), String(i)));
+          sel.value = String(d.upload_threads || 16);
+          if (d.upload_remote) document.getElementById("upRemoteInput").value = d.upload_remote;
+          document.getElementById("upTokenState").innerHTML = d.upload_has_server_token
+            ? '<span class="token-ok">✓ Токен Диска найден на этом компьютере</span>'
+            : 'Нужен токен Диска: впишите его в «Дополнительно»';
         });
+      ["upSourcesInput", "upRemoteInput"].forEach(id => {
+        document.getElementById(id).addEventListener("input", () => showError(id, ""));
+      });
+      try { if (localStorage.getItem("ydTab") === "up") showTab("up"); } catch (e) {}
       ["urlsInput", "destInput"].forEach(id => {
         document.getElementById(id).addEventListener("input", () => showError(id, ""));
       });
@@ -2048,7 +2359,8 @@ INDEX_HTML = """<!DOCTYPE html>
       fetch("/api/status")
         .then(r => r.json())
         .then(data => {
-          anyRunning = data.queues.some(q => q.is_running);
+          anyRunning = data.queues.some(q => q.is_running) || (data.uploads || []).some(q => q.is_running);
+          renderUploads(data.uploads || []);
           const select = document.getElementById("maxActive");
           if (!select.options.length) {
             for (let i = 1; i <= data.max_active_limit; i++) select.add(new Option(String(i), String(i)));
@@ -2063,7 +2375,7 @@ INDEX_HTML = """<!DOCTYPE html>
             }
           });
           data.queues.forEach(renderQueue);
-          document.getElementById("emptyNote").classList.toggle("hidden", data.queues.length > 0);
+          document.getElementById("emptyNote").classList.toggle("hidden", data.queues.length > 0 || (data.uploads || []).length > 0);
           renderSummary(data);
 
           document.getElementById("appLogCard").classList.toggle("hidden", !data.logs.length);
@@ -2079,7 +2391,8 @@ INDEX_HTML = """<!DOCTYPE html>
 </html>
 """
 
-ALLOWED_HOSTS = {f"{HOST}:{PORT}", f"localhost:{PORT}"}
+ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"{HOST}:{PORT}"} | {
+    h.strip() for h in os.environ.get('YDISK_ALLOWED_HOSTS', '').split(',') if h.strip()}
 
 class RequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, data, status=200):
@@ -2121,6 +2434,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "path": session.get('dest') or str(default_dir),
                 "proxy": session.get('proxy') or '',
                 "flat": bool(session.get('flat')),
+                # Для заливки: сам токен не отдаём, только есть ли он на этом компьютере
+                "upload_has_server_token": bool(uploader.load_server_token()),
+                "upload_remote": session.get('upload_remote') or '',
+                "upload_threads": session.get('upload_threads') if uploader.valid_threads(session.get('upload_threads')) else uploader.DEFAULT_THREADS,
+                "upload_max_threads": uploader.MAX_THREADS,
             })
         elif self.path == '/api/status':
             # Сериализуем под замком, а отправляем без него, чтобы не тормозить загрузку
@@ -2131,6 +2449,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "max_active_limit": MAX_ACTIVE_LIMIT,
                     "logs": app_state["logs"],
                 }, ensure_ascii=False))
+            snapshot["uploads"] = uploader.snapshot_all()
             self._send_json(snapshot)
         else:
             self.send_error(404)
@@ -2151,6 +2470,14 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         if self.path == '/api/start':
             self._start_queue(payload)
+        elif self.path == '/api/upload/start':
+            self._start_upload(payload)
+        elif self.path.startswith('/api/upload/'):
+            q = uploader.find(payload.get('id'))
+            if q is None:
+                self._send_error_json("Такой заливки нет", 404)
+            else:
+                self._upload_action(self.path.rsplit('/', 1)[1], q, payload)
         elif self.path in ('/api/pause', '/api/resume', '/api/stop', '/api/retry', '/api/restart', '/api/remove'):
             q = find_queue(payload.get('id'))
             if q is None:
@@ -2176,7 +2503,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "error", "message": "Окно выбора папки уже открыто"}, 409)
                 return
             try:
-                path = choose_folder_dialog(str(payload.get('current', '')))
+                prompt = 'Что залить на Яндекс.Диск?' if payload.get('purpose') == 'upload' else 'Куда сохранить файлы?'
+                path = choose_folder_dialog(str(payload.get('current', '')), prompt)
             except Exception as e:
                 self._send_json({"status": "error", "message": f"Не удалось открыть окно выбора папки: {e}"}, 500)
                 return
@@ -2213,6 +2541,42 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         update_session(dest=str(dest_path), proxy=proxy, flat=flat)
         self._send_json({"status": "started", "id": q.id})
+
+    def _start_upload(self, payload):
+        raw = payload.get('sources', [])
+        sources = [s.strip() for s in raw if isinstance(s, str) and s.strip()] if isinstance(raw, list) else []
+        remote = str(payload.get('remote', '')).strip()
+        threads = payload.get('threads', uploader.DEFAULT_THREADS)
+        token = str(payload.get('token', '')).strip() or None
+        q, error = uploader.add(sources, remote, threads, token)
+        if error:
+            self._send_error_json(error)
+            return
+        update_session(upload_remote=remote, upload_threads=threads)
+        self._send_json({"status": "started", "id": q.id})
+
+    def _upload_action(self, action, q, payload):
+        if action == 'pause':
+            error = None if uploader.pause(q) else "Нечего ставить на паузу"
+        elif action == 'resume':
+            error = None if uploader.resume(q) else "Заливка не на паузе"
+        elif action == 'stop':
+            error = None if uploader.stop(q) else "Заливка уже не идёт"
+        elif action == 'restart':
+            error = uploader.restart(q, str(payload.get('token', '')).strip() or None)
+        elif action == 'remove':
+            error = None if uploader.remove(q) else "Сначала остановите заливку"
+        elif action == 'top':
+            error = uploader.move_to_top(q)
+        elif action == 'threads':
+            error = uploader.set_threads(q, payload.get('threads'))
+        else:
+            self.send_error(404)
+            return
+        if error:
+            self._send_error_json(error)
+        else:
+            self._send_json({"status": "ok"})
 
     def _queue_action(self, action, q):
         if action == 'pause':
@@ -2271,19 +2635,23 @@ def resume_unfinished():
         if q.had_token:
             add_log("⚠️ Токен Яндекса не сохраняется. Если файлы не скачаются, добавьте ссылку заново с токеном.", q)
     save_queues()
+    uploader.restore(session.get('uploads'))
+
+uploader.hooks['save'] = lambda entries: update_session(uploads=entries)
 
 def run_server():
     server = ThreadingHTTPServer((HOST, PORT), RequestHandler)
     resume_unfinished()
-    url = f"http://{HOST}:{PORT}"
+    url = f"http://{'127.0.0.1' if HOST == '0.0.0.0' else HOST}:{PORT}"
     print(f"\n========================================================")
     print(f"🚀 YDisk Downloader запущен!")
     print(f"🌐 Откройте в браузере: {url}")
     print(f"========================================================\n")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+    if OPEN_BROWSER:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
