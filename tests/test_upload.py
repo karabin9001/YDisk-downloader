@@ -55,6 +55,10 @@ class FakeYandex:
         self.api_tokens = set()
         self.sessions = []
         self.list_calls = 0
+        self.raw_puts = []        # пути PUT как есть (с временным суффиксом)
+        self.moves = []           # (откуда, куда)
+        self.move_404 = 0         # столько первых переименований ответят 404 («файл ещё не появился»)
+        self.move_async = False   # отвечать на переименование 202 + операцией
 
     def session(self):
         s = FakeSession(self)
@@ -64,6 +68,10 @@ class FakeYandex:
     def parent_exists(self, path):
         parent = path.rsplit('/', 1)[0]
         return parent == 'disk:' or parent in self.dirs
+
+    @staticmethod
+    def real(path):
+        return path[:-len(uploader.FAST_SUFFIX)] if path.endswith(uploader.FAST_SUFFIX) else path
 
     def handle(self, method, url, params, data, headers):
         params = params or {}
@@ -93,8 +101,24 @@ class FakeYandex:
                     return FakeResp(409, {'error': 'DiskPathDoesntExistsError'})
                 self.dirs.add(path)
                 return FakeResp(201, {})
+            if endpoint == '/resources/move' and method == 'POST':
+                src, dst = params.get('from'), params.get('path')
+                if self.move_404:
+                    self.move_404 -= 1
+                    return FakeResp(404, {'error': 'DiskNotFoundError'})
+                if src not in self.files:
+                    return FakeResp(404, {'error': 'DiskNotFoundError'})
+                if dst in self.files and params.get('overwrite') != 'true':
+                    return FakeResp(409, {'error': 'DiskResourceAlreadyExistsError'})
+                self.files[dst] = self.files.pop(src)
+                self.moves.append((src, dst))
+                if self.move_async:
+                    return FakeResp(202, {'href': uploader.API + '/operations/op1', 'method': 'GET'})
+                return FakeResp(201, {})
+            if endpoint.startswith('/operations/'):
+                return FakeResp(200, {'status': 'success'})
             if endpoint == '/resources/upload':
-                codes = self.fail_link.get(path)
+                codes = self.fail_link.get(self.real(path))
                 if codes:
                     code = codes.pop(0)
                     err = 'DiskPathDoesntExistsError' if code == 409 else 'Error'
@@ -113,7 +137,8 @@ class FakeYandex:
         self.uploader_auth.append(headers.get('Authorization'))
         expected = len(data)
         with self.lock:
-            self.put_attempts.append(path)
+            self.raw_puts.append(path)
+            self.put_attempts.append(self.real(path))
             self.in_flight += 1
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
@@ -130,7 +155,7 @@ class FakeYandex:
             with self.lock:
                 self.in_flight -= 1
         with self.lock:
-            codes = self.fail_put.get(path)
+            codes = self.fail_put.get(self.real(path))
             if codes:
                 return FakeResp(codes.pop(0), {'error': 'Fake'})
             assert len(got) == expected, (len(got), expected)
@@ -326,6 +351,30 @@ class UploadTest(Base):
         # Токен уходит только в API, загрузчику он не нужен
         self.assertEqual(self.fake.api_tokens, {'OAuth ' + TOKEN})
         self.assertEqual(set(self.fake.uploader_auth), {None})
+
+    def test_uploads_under_txt_name_then_renames(self):
+        self.make('P/clip.mp4', 3000)
+        self.make('P/notes.txt', 100)
+        snap = self.finish(self.add([self.tmp / 'P']))
+        self.assertEqual(snap['display'], 'done', snap['logs'])
+        # Видео ушло под временным .txt-именем (его Яндекс не режет), .txt — как есть
+        self.assertEqual(sorted(self.fake.raw_puts), [
+            'disk:/Заливка/Тест/P/clip.mp4' + uploader.FAST_SUFFIX,
+            'disk:/Заливка/Тест/P/notes.txt',
+        ])
+        self.assertEqual(self.fake.moves, [('disk:/Заливка/Тест/P/clip.mp4' + uploader.FAST_SUFFIX,
+                                            'disk:/Заливка/Тест/P/clip.mp4')])
+        self.assertEqual(self.fake.files, {'disk:/Заливка/Тест/P/clip.mp4': 3000,
+                                           'disk:/Заливка/Тест/P/notes.txt': 100})
+
+    def test_rename_waits_until_file_appears_and_handles_async(self):
+        self.make('P/a.mov', 2000)
+        self.fake.move_404 = 2
+        self.fake.move_async = True
+        snap = self.finish(self.add([self.tmp / 'P']))
+        self.assertEqual(snap['display'], 'done', snap['logs'])
+        self.assertEqual(self.fake.files, {'disk:/Заливка/Тест/P/a.mov': 2000})
+        self.assertEqual(self.fake.put_attempts.count('disk:/Заливка/Тест/P/a.mov'), 1)  # Повторялось только переименование
 
     def test_skips_files_already_there_with_same_size(self):
         src = self.project()
@@ -657,6 +706,14 @@ class RealHttpTest(Base):
                 self.end_headers()
                 self.wfile.write(body)
 
+            def do_POST(self):
+                # Переименование временного .txt в настоящее имя
+                test.got['move'] = self.path
+                self.send_response(201)
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                self.wfile.write(b'{}')
+
             def do_PUT(self):
                 test.got['length'] = self.headers.get('Content-Length')
                 test.got['chunked'] = self.headers.get('Transfer-Encoding')
@@ -702,6 +759,8 @@ class RealHttpTest(Base):
         self.assertIsNone(self.got['auth'])
         self.assertEqual(self.got['size'], item['size'])
         self.assertEqual(item['sent'], item['size'])
+        self.assertIn('/resources/move', self.got['move'])
+        self.assertIn('real.bin.ydupload.txt', urllib.parse.unquote(self.got['move']))
 
     def test_stop_breaks_running_put(self):
         q = uploader.UploadQueue([], 'disk:/R', 1, TOKEN)

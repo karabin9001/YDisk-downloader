@@ -4,10 +4,13 @@
 
 Как устроено (по замерам 18.11.2026 и документации Яндекса):
 - Файл заливается так: GET /v1/disk/resources/upload → ссылка → один PUT с файлом на эту ссылку.
-- Яндекс ограничивает КАЖДОЕ соединение (около 1 Мбит/с), но параллельные PUT разных файлов
-  складываются: поэтому файлы льются в N потоков (по умолчанию 16), самые крупные первыми.
-- Один файл ускорить нельзя: на файл выдаётся одна ссылка, а загрузку по частям или в несколько
-  соединений API не описывает. Это честно показывается в интерфейсе.
+- Яндекс режет скорость заливки по РАСШИРЕНИЮ файла (замер 19.11.2026 с сервера, порт 100 Мбит):
+  .mp4 и .bin — короткий рывок ~30 МБ, потом около 1 Мбит/с; .txt — 89 Мбит/с, упор в порт.
+  Поэтому каждый файл (кроме .txt) льётся под временным именем «<имя>.ydupload.txt» и сразу
+  после заливки переименовывается на Диске (POST /resources/move). Видео после переименования
+  Яндекс видит как обычное видео (mime video/mp4).
+- Параллельные PUT разных файлов складываются: файлы льются в N потоков (по умолчанию 16),
+  самые крупные первыми. На файл выдаётся одна ссылка: один файл идёт одним соединением.
 - Яндексу прокси не нужен и только тормозит: сессии всегда идут напрямую (trust_env=False).
 
 Токен в журнал, в ответы интерфейса и в session.json не попадает.
@@ -35,6 +38,8 @@ READ_BLOCK = 256 * 1024
 LIST_LIMIT = 1000
 SPEED_WINDOW = 15           # за сколько секунд считать скорость
 LOG_LIMIT = 300
+FAST_SUFFIX = '.ydupload.txt'  # временное имя на время заливки: .txt Яндекс не притормаживает
+MOVE_WAIT = 120             # сколько ждать, пока свежезалитый файл появится на Диске для переименования
 ORDER_MAX = 64              # пометка заказа: по ней Пульт показывает заливку в карточке заказа
 
 # Мусор macOS и Windows: на Диске он не нужен
@@ -276,6 +281,52 @@ def list_remote(sess, token, root):
     return files, dirs
 
 
+def temp_remote(remote):
+    """Временное имя на время заливки: «a.mp4» → «a.mp4.ydupload.txt». Файлы .txt — как есть."""
+    return remote if remote.lower().endswith('.txt') else remote + FAST_SUFFIX
+
+
+def move_into_place(sess, token, src, dst, abort=None):
+    """Переименовывает залитый временный файл в настоящее имя (с заменой).
+
+    Сразу после PUT файл может ещё «перевариваться» и не находиться (404) — ждём до MOVE_WAIT с.
+    Большие перемещения Яндекс делает асинхронно (202 + операция) — дожидаемся её.
+    """
+    deadline = time.time() + MOVE_WAIT
+    while True:
+        r = api_request(sess, token, 'POST', '/resources/move',
+                        {'from': src, 'path': dst, 'overwrite': 'true'}, 'Переименование на Диске')
+        if r.status_code == 404 and time.time() < deadline:
+            if abort is not None and abort.wait(2):
+                raise Aborted()
+            if abort is None:
+                time.sleep(2)
+            continue
+        raise_for(r, 'Переименование на Диске')
+        break
+    if r.status_code != 202:
+        return
+    try:
+        href = (r.json() or {}).get('href') or ''
+    except ValueError:
+        href = ''
+    if not href.startswith(API):
+        return
+    while time.time() < deadline:
+        o = api_request(sess, token, 'GET', href[len(API):], {}, 'Переименование на Диске')
+        raise_for(o, 'Переименование на Диске')
+        status = (o.json() or {}).get('status')
+        if status == 'success':
+            return
+        if status == 'failed':
+            raise TransientError('Переименование на Диске: Яндекс вернул failed')
+        if abort is not None and abort.wait(1):
+            raise Aborted()
+        if abort is None:
+            time.sleep(1)
+    raise TransientError('Переименование на Диске: операция не закончилась вовремя')
+
+
 def make_dir(sess, token, path):
     r = api_request(sess, token, 'PUT', '/resources', {'path': path}, 'Создание папки на Диске')
     if r.status_code == 409:
@@ -435,9 +486,8 @@ class UploadQueue:
             if single_note:
                 n = len(self.active)
                 notice = (f"Остались только начатые файлы ({n}). Каждый файл Яндекс принимает одним соединением, "
-                          "а одно соединение он ограничивает (около 1 Мбит/с по замерам). Загрузку одного файла "
-                          "по частям или в несколько потоков API Диска не поддерживает, поэтому ускорить их нельзя — "
-                          "остаётся ждать.")
+                          "по частям его не залить. Файлы идут под временным именем .txt, чтобы Яндекс не "
+                          "притормаживал видео, и в конце переименовываются.")
             elif st['is_paused'] and self.active and st['is_running']:
                 notice = (f"Новые файлы не начинаются. Уже начатые ({len(self.active)}) догружаются, "
                           "чтобы не терять отправленное: прервать их можно кнопкой «Стоп».")
@@ -519,6 +569,7 @@ def upload_one(q, item, sess):
     """Заливает один файл с повторами. Возвращает 'done', 'failed' или 'stopped'."""
     token = q.token
     last_error = ''
+    tmp = temp_remote(item['remote'])
     for attempt in range(1, FILE_RETRIES + 1):
         if q.abort.is_set():
             return 'stopped'
@@ -528,7 +579,7 @@ def upload_one(q, item, sess):
         reader = None
         try:
             r = api_request(sess, token, 'GET', '/resources/upload',
-                            {'path': item['remote'], 'overwrite': 'true', 'fields': 'href,method'},
+                            {'path': tmp, 'overwrite': 'true', 'fields': 'href,method'},
                             'Ссылка для заливки')
             try:
                 raise_for(r, 'Ссылка для заливки')
@@ -544,6 +595,14 @@ def upload_one(q, item, sess):
             except requests.RequestException as e:
                 raise TransientError(f"Обрыв при отправке: {type(e).__name__}") from None
             if p.status_code in (200, 201, 202):
+                if tmp != item['remote']:
+                    # Файл уже на Диске под временным именем: повторяем только переименование
+                    try:
+                        with_retries(q, lambda: move_into_place(sess, token, tmp, item['remote'], q.abort),
+                                     'Переименование на Диске')
+                    except FatalError as e:
+                        item['error'] = f"Залит, но не переименован (на Диске лежит «{tmp.rsplit('/', 1)[-1]}»): {e}"
+                        return 'failed'
                 return 'done'
             raise_for(p, 'Отправка файла')
             raise TransientError(f"Отправка файла: неожиданный ответ HTTP {p.status_code}")
@@ -676,8 +735,7 @@ def run_upload(q):
     todo.sort(key=lambda f: -f['size'])  # Крупные первыми: они самые долгие
     big = [f for f in todo if f['size'] >= 2 * 1024**3]
     if big:
-        q.log(f"🐢 Больших файлов (от 2 ГБ): {len(big)}. Каждый идёт одним соединением, а его Яндекс "
-              "ограничивает — ускорить одиночный файл нельзя, они начаты первыми.")
+        q.log(f"🐢 Больших файлов (от 2 ГБ): {len(big)}. Каждый идёт одним соединением, поэтому они начаты первыми.")
 
     with q.cond:
         q.pending = deque(todo)
