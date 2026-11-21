@@ -39,6 +39,7 @@ LIST_LIMIT = 1000
 SPEED_WINDOW = 15           # за сколько секунд считать скорость
 LOG_LIMIT = 300
 FAST_SUFFIX = '.ydupload.txt'  # временное имя на время заливки: .txt Яндекс не притормаживает
+PLAIN_MAX = 25 * 1024**2     # «обычные имена» только до этого размера: крупнее Яндекс обрывает заливку .mp4
 MOVE_WAIT = 120             # сколько ждать, пока свежезалитый файл появится на Диске для переименования
 ORDER_MAX = 64              # пометка заказа: по ней Пульт показывает заливку в карточке заказа
 
@@ -327,6 +328,44 @@ def move_into_place(sess, token, src, dst, abort=None):
     raise TransientError('Переименование на Диске: операция не закончилась вовремя')
 
 
+def trash_remote(sess, token, path):
+    """Убирает файл на Диске в Корзину Яндекса (не навсегда). Нет файла — не ошибка."""
+    r = api_request(sess, token, 'DELETE', '/resources', {'path': path}, 'Уборка временного файла')
+    if r.status_code in (202, 204, 404):
+        return r.status_code != 404
+    raise_for(r, 'Уборка временного файла')
+    return True
+
+
+def tidy_temps(q, sess, remote_files, local_sizes=None):
+    """Временные «.ydupload.txt» в папке заливки, оставшиеся от прошлых обрывов:
+    - рядом есть настоящий файл → временный в Корзину (это лишняя копия, клиент увидит его в ссылке);
+    - настоящего нет, а размер совпадает с локальным файлом → переименовываем, повторно не льём.
+    Возвращает множество путей, которые после этого лежат на Диске под настоящим именем."""
+    placed = set()
+    temps = [p for p in remote_files if p.endswith(FAST_SUFFIX)]
+    for tmp in temps:
+        real = tmp[:-len(FAST_SUFFIX)]
+        name = real.rsplit('/', 1)[-1]
+        try:
+            if real in remote_files:
+                if trash_remote(sess, q.token, tmp):
+                    q.log(f"🧹 Убран лишний временный файл «{name}{FAST_SUFFIX}» (в Корзину Диска)")
+            elif local_sizes is not None and local_sizes.get(real) == remote_files[tmp]:
+                move_into_place(sess, q.token, tmp, real, q.abort)
+                remote_files[real] = remote_files[tmp]
+                placed.add(real)
+                q.log(f"🧹 «{name}» уже был залит под временным именем — переименован, повторно не льётся")
+            else:
+                continue
+            remote_files.pop(tmp, None)
+        except Aborted:
+            raise
+        except Exception as e:                       # уборка не должна ронять заливку
+            q.log(f"⚠️ Не удалось убрать «{name}{FAST_SUFFIX}»: {e}")
+    return placed
+
+
 def make_dir(sess, token, path):
     r = api_request(sess, token, 'PUT', '/resources', {'path': path}, 'Создание папки на Диске')
     if r.status_code == 409:
@@ -397,7 +436,7 @@ class UploadQueue:
     def __init__(self, sources, remote, threads=DEFAULT_THREADS, token=None, queue_id=None,
                  paused=False, had_token=False, public_url='', order='', plain=False):
         self.id = queue_id or secrets.token_hex(4)
-        self.plain = bool(plain)          # True: лить под настоящим именем, без обхода «.ydupload.txt» (видео с превью на Диске)
+        self.plain = bool(plain)          # True: файлы до PLAIN_MAX лить под настоящим именем; крупнее — всё равно через «.ydupload.txt»
         self.order = clean_order(order)
         self.sources = list(sources)
         self.remote = remote
@@ -570,7 +609,8 @@ def upload_one(q, item, sess):
     """Заливает один файл с повторами. Возвращает 'done', 'failed' или 'stopped'."""
     token = q.token
     last_error = ''
-    tmp = item['remote'] if getattr(q, 'plain', False) else temp_remote(item['remote'])
+    plain = getattr(q, 'plain', False) and item['size'] <= PLAIN_MAX
+    tmp = item['remote'] if plain else temp_remote(item['remote'])
     for attempt in range(1, FILE_RETRIES + 1):
         if q.abort.is_set():
             return 'stopped'
@@ -634,7 +674,18 @@ def upload_one(q, item, sess):
             if reader:
                 reader.close()
     item['error'] = f"Не залилось за {FILE_RETRIES} попыток: {last_error}"
+    drop_temp(q, sess, tmp, item)
     return 'failed'
+
+
+def drop_temp(q, sess, tmp, item):
+    """После неудачи временный файл (если Яндекс успел его сохранить) не должен остаться на Диске."""
+    if tmp == item['remote']:
+        return
+    try:
+        trash_remote(sess, q.token, tmp)
+    except Exception:
+        pass                                          # не вышло — уберёт следующая заливка в эту папку
 
 
 def q_fail_fatal(q, message):
@@ -722,9 +773,11 @@ def run_upload(q):
     for d in need:
         with_retries(q, lambda d=d: make_dir(sess, q.token, d), 'Создание папки на Диске')
 
+    placed = with_retries(q, lambda: tidy_temps(q, sess, remote_files, {f['remote']: f['size'] for f in files}),
+                          'Уборка временных файлов')
     todo = []
     for f in files:
-        if remote_files.get(f['remote']) == f['size']:
+        if remote_files.get(f['remote']) == f['size'] or f['remote'] in placed:
             with ulock:
                 st['skipped_files'] += 1
                 st['skipped_bytes'] += f['size']
@@ -757,6 +810,16 @@ def run_upload(q):
         raise FatalError(q.fatal)
     if q.abort.is_set():
         raise Aborted()
+    try:                                              # контрольная уборка: в публичной папке не должно быть .ydupload.txt
+        after, _ = list_remote(sess, q.token, q.remote)
+        tidy_temps(q, sess, after)
+        for left in [p for p in after if p.endswith(FAST_SUFFIX)]:
+            q.log(f"⚠️ В папке остался временный файл без пары: «{left.rsplit('/', 1)[-1]}». "
+                  f"Он попадёт в публичную ссылку — проверь и убери вручную, если не нужен")
+    except Aborted:
+        raise
+    except Exception as e:
+        q.log(f"⚠️ Контрольная уборка временных файлов не прошла: {e}")
     if st['failed']:
         return
     q.set_phase('publishing', 'Публикую папку…')
