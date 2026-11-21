@@ -223,7 +223,7 @@ def parser():
     u.add_argument('--to', required=True, help='папка на Диске, например «Рендеры заказов/3909_Подкаст/v1»')
     u.add_argument('--threads', type=int, default=16)
 
-    d = sub.add_parser('download', help='скачать по ссылкам Я.Диска / Google Drive')
+    d = sub.add_parser('download', help='скачать по ссылкам Я.Диска / Google Drive / ORV Cloud')
     d.add_argument('urls', nargs='+')
     d.add_argument('--dest', required=True, help='папка назначения (на той машине, где загрузчик)')
     d.add_argument('--flat', action='store_true', help='без подпапки с именем ссылки')

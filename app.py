@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YDisk Downloader — локальный веб-инструмент пакетного скачивания с Яндекс.Диска и Google Drive.
+YDisk Downloader — локальный веб-инструмент пакетного скачивания с Яндекс.Диска, Google Drive и ORV Cloud.
 Работает на Mac и Windows, скачивает на максимальной скорости с автодокачкой.
 Ведёт несколько очередей сразу: у каждой своя папка, прогресс, журнал и кнопки Пауза / Стоп.
 """
@@ -570,6 +570,91 @@ def scan_gdrive_link(raw_url, known_ids, q):
     raise PermanentError("Это ссылка Google, но не на папку и не на файл Drive")
 
 # ==========================================
+# ORV CLOUD (раздачи cloud.orvflow.ru)
+# ==========================================
+# Раздача: <share>/list[?folder_id=…] → JSON {breadcrumbs, folders, files[{id, name, size}]},
+# файл: <share>/file/<id>/download (поддерживает Range). Входа нет. Сервер открывается только напрямую:
+# через финский туннель сервера соединение не проходит.
+
+ORVFLOW_HOSTS = ('cloud.orvflow.ru',)
+
+def parse_orvflow_url(url):
+    """Возвращает {'share', 'folder_id'} для ссылки ORV Cloud, None для прочих ссылок."""
+    parsed = urllib.parse.urlparse(url if '://' in url else 'https://' + url)
+    host = (parsed.hostname or '').lower()
+    if host not in ORVFLOW_HOSTS:
+        return None
+    m = re.match(r'/s/([\w-]+)', parsed.path)
+    if not m:
+        raise PermanentError("Это ссылка ORV Cloud, но не на раздачу (нужна вида …/s/<код>)")
+    folder_id = (urllib.parse.parse_qs(parsed.query).get('folder_id') or [None])[0]
+    return {'share': f"{parsed.scheme or 'https'}://{parsed.netloc}/s/{m.group(1)}", 'folder_id': folder_id}
+
+def orvflow_get(url, params=None, headers=None, stream=False):
+    session = requests.Session()
+    session.trust_env = False  # Только напрямую: системный прокси (туннель) до ORV Cloud не доходит
+    return session.get(url, params=params, headers={'User-Agent': 'Mozilla/5.0', **(headers or {})},
+                       stream=stream, timeout=30)
+
+def orvflow_list(share, folder_id=None):
+    r = orvflow_get(f"{share}/list", params={'folder_id': folder_id} if folder_id else None)
+    if r.status_code in (401, 403, 404, 410):
+        raise PermanentError(f"Раздача ORV Cloud недоступна (HTTP {r.status_code}): закрыта или ссылка неверна")
+    if r.status_code != 200:
+        raise RetryableHTTP(f"ORV Cloud вернул HTTP {r.status_code}", retry_after_seconds(r))
+    try:
+        data = r.json()
+    except ValueError:
+        raise RetryableHTTP("ORV Cloud вернул не список файлов")
+    if not isinstance(data, dict) or not isinstance(data.get('files'), list):
+        raise RetryableHTTP("ORV Cloud вернул список без файлов")
+    return data
+
+def orvflow_walk(q, share, folder_id, prefix, files, dirs, visited):
+    """Обходит папку раздачи со всеми вложенными. Возвращает имя папки."""
+    data = with_retries(lambda: orvflow_list(share, folder_id), "Список файлов ORV Cloud", q)
+    here = (data.get('folder') or {}).get('id') or folder_id or ''
+    visited.add(here)
+    crumbs = data.get('breadcrumbs') or []
+    title = (crumbs[-1].get('name') if crumbs else '') or 'ORV_Cloud'
+    used_names = set()
+    entries = [('file', f) for f in data['files']] + [('dir', d) for d in data.get('folders') or []]
+    for kind, e in entries:
+        # Имена в одной папке могут совпасть: различаем по id, как у Google
+        name = str(e.get('name') or e.get('id') or '_').replace('/', '_')
+        if name.casefold() in used_names:
+            stem, ext = os.path.splitext(name)
+            name = f"{stem} [{str(e.get('id'))[:8]}]{ext}"
+        used_names.add(name.casefold())
+        rel = prefix + name
+        if kind == 'dir':
+            if e.get('id') and e['id'] not in visited:
+                dirs.append(rel)
+                orvflow_walk(q, share, e['id'], rel + '/', files, dirs, visited)
+        elif e.get('id'):
+            size = e.get('size')
+            files.append({'name': name, 'path': rel, 'size': size if isinstance(size, int) else None,
+                          'orv_id': e['id'], 'orv_share': share})
+    return title
+
+def scan_orvflow_link(raw_url, q):
+    info = parse_orvflow_url(raw_url)
+    files, dirs = [], []
+    name = orvflow_walk(q, info['share'], info['folder_id'], '', files, dirs, set())
+    files.sort(key=lambda f: f['path'])
+    return {'name': name, 'is_folder': True, 'dirs': dirs, 'skipped': [], 'files': files}
+
+def link_source(raw_url):
+    if parse_gdrive_url(raw_url):
+        return 'gdrive'
+    try:
+        if parse_orvflow_url(raw_url):
+            return 'orvflow'
+    except PermanentError:
+        return 'orvflow'
+    return 'yandex'
+
+# ==========================================
 # СОХРАНЕНИЕ ОЧЕРЕДИ МЕЖДУ ЗАПУСКАМИ
 # ==========================================
 
@@ -883,10 +968,16 @@ def open_stream(item, start_byte):
     if item['source'] == 'gdrive':
         return gdrive_open(item['gdrive_id'], item['resource_key'], start_byte, proxy=q.proxy)
 
-    # Ссылка CDN живёт недолго, поэтому берём новую на каждую попытку
-    href = get_download_link(item['public_key'], item['remote_path'], token=q.token)
     headers = {'Range': f'bytes={start_byte}-'} if start_byte > 0 else {}
-    r = yandex_get(href, headers=headers, stream=True, timeout=30)
+    if item['source'] == 'orvflow':
+        r = orvflow_get(f"{item['orv_share']}/file/{item['orv_id']}/download", headers=headers, stream=True)
+        if r.status_code in (401, 404, 410):
+            r.close()
+            raise PermanentError(f"ORV Cloud: файла больше нет в раздаче (HTTP {r.status_code})")
+    else:
+        # Ссылка CDN живёт недолго, поэтому берём новую на каждую попытку
+        href = get_download_link(item['public_key'], item['remote_path'], token=q.token)
+        r = yandex_get(href, headers=headers, stream=True, timeout=30)
     if r.status_code in (200, 206, 416):
         return r
     status = r.status_code
@@ -1106,7 +1197,11 @@ def scan_yandex_link(raw_url, q):
     return {'name': root_name, 'is_folder': True, 'dirs': sorted(set(dirs)), 'skipped': [], 'files': files}
 
 def file_key(raw_url, f):
-    return f"gdrive:{f['gdrive_id']}" if f.get('gdrive_id') else f"yandex:{raw_url}:{f['path']}"
+    if f.get('gdrive_id'):
+        return f"gdrive:{f['gdrive_id']}"
+    if f.get('orv_id'):
+        return f"orvflow:{f['orv_share']}:{f['orv_id']}"
+    return f"yandex:{raw_url}:{f['path']}"
 
 def waiting_text(q):
     """Что показать, пока в очереди остались только отложенные файлы. Вызывать под lock."""
@@ -1130,8 +1225,11 @@ def run_queue(q):
 
     def add_link(raw_url):
         """Сканирует ссылку и ставит в очередь файлы, которых в ней ещё нет. Возвращает их число."""
-        if parse_gdrive_url(raw_url):
+        source = link_source(raw_url)
+        if source == 'gdrive':
             scan = scan_gdrive_link(raw_url, {k.split(':', 1)[1] for k in known if k.startswith('gdrive:')}, q)
+        elif source == 'orvflow':
+            scan = scan_orvflow_link(raw_url, q)
         else:
             scan = scan_yandex_link(raw_url, q)
 
@@ -1150,7 +1248,7 @@ def run_queue(q):
             with lock:
                 link_folders[raw_url] = len(folders_meta)
                 folders_meta.append({
-                    "name": scan['name'], "url": raw_url, "source": "gdrive" if parse_gdrive_url(raw_url) else "yandex",
+                    "name": scan['name'], "url": raw_url, "source": source,
                     "total_files": 0, "done_files": 0, "total_bytes": 0, "done_bytes": 0,
                     "total_gb": 0.0, "done_gb": 0.0, "status": "wait",
                     "deferred": 0, "failed": 0, "skipped": len(scan['skipped']), "files": []
@@ -1171,12 +1269,14 @@ def run_queue(q):
                 entry["url"] = GDRIVE_FILE_PAGE_URL.format(f['gdrive_id'])
             item = {
                 "queue": q,
-                "source": "gdrive" if f.get('gdrive_id') else "yandex",
+                "source": "gdrive" if f.get('gdrive_id') else "orvflow" if f.get('orv_id') else "yandex",
                 "public_key": raw_url,
                 "folder_idx": folder_idx,
                 "remote_path": f['path'],
                 "gdrive_id": f.get('gdrive_id'),
                 "resource_key": f.get('resource_key'),
+                "orv_id": f.get('orv_id'),
+                "orv_share": f.get('orv_share'),
                 "dest_path": target_folder / (safe_rel_path(f['path']) if f['path'] else safe_rel_path(scan['name'])),
                 "name": f['name'],
                 "size": size,
@@ -1685,7 +1785,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="brand-icon">⬇</div>
         <div>
           <h1>YDisk Downloader</h1>
-          <p>Скачивает папки с Яндекс Диска и Google Drive целиком и заливает на Яндекс Диск</p>
+          <p>Скачивает папки с Яндекс Диска, Google Drive и ORV Cloud целиком и заливает на Яндекс Диск</p>
         </div>
       </div>
       <div class="header-right">
@@ -1759,7 +1859,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="step-body">
           <div class="step-label">Вставьте ссылку на папку или файл</div>
           <textarea id="urlsInput" placeholder="https://disk.yandex.ru/d/…&#10;https://drive.google.com/drive/folders/…"></textarea>
-          <div class="hint">Яндекс Диск или Google Drive. Если ссылок несколько, каждая с новой строки — они скачаются в одну папку.</div>
+          <div class="hint">Яндекс Диск, Google Drive или ORV Cloud (cloud.orvflow.ru). Если ссылок несколько, каждая с новой строки — они скачаются в одну папку.</div>
           <div class="error-text hidden" id="urlsError"></div>
         </div>
       </div>
