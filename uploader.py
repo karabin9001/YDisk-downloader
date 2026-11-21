@@ -25,6 +25,8 @@ from pathlib import Path
 
 import requests
 
+import ratelimit  # общий лимит скорости заливки (ползунок в интерфейсе)
+
 API = 'https://cloud-api.yandex.net/v1/disk'
 DEFAULT_THREADS = 16
 MAX_THREADS = 32
@@ -401,6 +403,8 @@ class ProgressReader:
             raise Aborted()
         chunk = self._f.read(READ_BLOCK if n is None or n < 0 else min(n, READ_BLOCK))
         if chunk:
+            if not ratelimit.UP.consume(len(chunk), self._abort.is_set):
+                raise Aborted()
             self._on_bytes(len(chunk))
         return chunk
 

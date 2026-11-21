@@ -49,10 +49,12 @@ except ImportError:
     import requests
 
 import uploader  # Заливка на Яндекс.Диск
+import ratelimit  # Общий лимит скорости: ползунки «скачивание» и «заливка»
 
 # По умолчанию программа видна только с этого компьютера. На домашнем сервере можно открыть её для
 # локальной сети: YDISK_HOST=0.0.0.0 и YDISK_ALLOWED_HOSTS=192.168.1.77:7860 (адреса, по которым её открывают)
 HOST = os.environ.get('YDISK_HOST') or "127.0.0.1"
+CHANNEL_MBIT = int(os.environ.get('YDISK_CHANNEL_MBIT') or 100)  # канал интернета: верх ползунков скорости
 PORT = int(os.environ.get('YDISK_PORT') or 7860)  # Другой порт нужен только для проверок
 OPEN_BROWSER = not os.environ.get('YDISK_NO_BROWSER')
 # Страницу открывают с другого компьютера: окно выбора папки открылось бы на сервере, где его никто не видит
@@ -1107,6 +1109,14 @@ def download_item(item):
                                     break
                                 if not chunk:
                                     continue
+                                if not ratelimit.DOWN.consume(
+                                        len(chunk), lambda: st["should_stop"] or st["is_paused"] or not q.has_slot):
+                                    paused_mid_file = not st["should_stop"]
+                                    f.write(chunk)                 # уже скачанное не выбрасываем
+                                    current_file_downloaded += len(chunk)
+                                    got += len(chunk)
+                                    add_progress(item, current_file_downloaded)
+                                    break
                                 f.write(chunk)
                                 c_len = len(chunk)
                                 current_file_downloaded += c_len
@@ -1569,6 +1579,20 @@ def remove_queue(q):
     save_queues()
     return True
 
+def set_limits(down=None, up=None):
+    """Лимит скорости в Мбит/с (0 — без ограничения) для всех очередей сразу, запоминается между запусками."""
+    fields = {}
+    if down is not None:
+        ratelimit.DOWN.set_mbit(down)
+        fields['limit_down_mbit'] = down
+    if up is not None:
+        ratelimit.UP.set_mbit(up)
+        fields['limit_up_mbit'] = up
+    if fields:
+        update_session(**fields)
+        add_log("🚦 Лимит скорости: скачивание " + (f"{ratelimit.DOWN.mbit} Мбит/с" if ratelimit.DOWN.mbit else "без ограничения")
+                + ", заливка " + (f"{ratelimit.UP.mbit} Мбит/с" if ratelimit.UP.mbit else "без ограничения"))
+
 def set_max_active(value):
     with slot_changed:
         app_state["max_active"] = value
@@ -1691,6 +1715,11 @@ INDEX_HTML = """<!DOCTYPE html>
     .field select { width: auto; min-width: 90px; }
 
     /* Список загрузок */
+    .speed-box { margin: 18px 0 6px; padding: 14px 16px; border: 1px solid var(--line, #2a2f3a); border-radius: 12px; }
+    .speed-row { display: grid; grid-template-columns: 120px 1fr 150px; align-items: center; gap: 12px; margin-bottom: 8px; font-size: 14px; }
+    .speed-row input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .speed-val { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; text-align: right; }
+    @media (max-width: 560px) { .speed-row { grid-template-columns: 1fr; gap: 4px; } .speed-val { text-align: left; } }
     .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
     .section-head h2 { font-size: 17px; font-weight: 700; }
     .summary { font-size: 13px; color: var(--muted); }
@@ -1907,6 +1936,20 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         </div>
       </details>
+    </div>
+
+    <div class="speed-box" id="speedBox">
+      <div class="speed-row">
+        <label for="limDown">⬇ Скачивание</label>
+        <input type="range" id="limDown" min="5" step="5" oninput="limitPreview()" onchange="saveLimits()">
+        <span class="speed-val" id="limDownVal"></span>
+      </div>
+      <div class="speed-row">
+        <label for="limUp">⬆ Заливка</label>
+        <input type="range" id="limUp" min="5" step="5" oninput="limitPreview()" onchange="saveLimits()">
+        <span class="speed-val" id="limUpVal"></span>
+      </div>
+      <div class="hint" id="speedHint">Справа до упора — без ограничения. Лимит общий для всех загрузок этого направления.</div>
     </div>
 
     <div class="section-head">
@@ -2278,6 +2321,32 @@ INDEX_HTML = """<!DOCTYPE html>
         });
     }
 
+    let limitTouched = 0;
+    function limitText(v, ch) { return v >= ch ? "без ограничения" : `${v} Мбит/с · вам ≈ ${ch - v}`; }
+    function limitPreview() {
+      limitTouched = Date.now();
+      const ch = Number(document.getElementById("limDown").max) || 100;
+      document.getElementById("limDownVal").textContent = limitText(Number(document.getElementById("limDown").value), ch);
+      document.getElementById("limUpVal").textContent = limitText(Number(document.getElementById("limUp").value), ch);
+    }
+    function saveLimits() {
+      const ch = Number(document.getElementById("limDown").max) || 100;
+      const v = id => { const x = Number(document.getElementById(id).value); return x >= ch ? 0 : x; };
+      postJSON("/api/settings", { limit_down_mbit: v("limDown"), limit_up_mbit: v("limUp") });
+      limitTouched = Date.now();
+    }
+    function showLimits(data) {
+      if (data.channel_mbit === undefined || Date.now() - limitTouched < 3000) return;
+      const ch = data.channel_mbit;
+      for (const [id, val] of [["limDown", data.limit_down_mbit], ["limUp", data.limit_up_mbit]]) {
+        const el = document.getElementById(id);
+        el.max = ch;
+        if (document.activeElement !== el) el.value = val > 0 ? Math.min(val, ch) : ch;
+      }
+      document.getElementById("limDownVal").textContent = limitText(Number(document.getElementById("limDown").value), ch);
+      document.getElementById("limUpVal").textContent = limitText(Number(document.getElementById("limUp").value), ch);
+    }
+
     function saveMaxActive() {
       postJSON("/api/settings", { max_active: Number(document.getElementById("maxActive").value) });
     }
@@ -2476,6 +2545,7 @@ INDEX_HTML = """<!DOCTYPE html>
             for (let i = 1; i <= data.max_active_limit; i++) select.add(new Option(String(i), String(i)));
           }
           if (document.activeElement !== select) select.value = String(data.max_active);
+          showLimits(data);
 
           const alive = new Set(data.queues.map(q => q.id));
           cards.forEach((refs, id) => {
@@ -2557,6 +2627,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "queues": [q.snapshot() for q in queues],
                     "max_active": app_state["max_active"],
                     "max_active_limit": MAX_ACTIVE_LIMIT,
+                    "limit_down_mbit": ratelimit.DOWN.mbit,
+                    "limit_up_mbit": ratelimit.UP.mbit,
+                    "channel_mbit": CHANNEL_MBIT,
                     "logs": app_state["logs"],
                 }, ensure_ascii=False))
             snapshot["uploads"] = uploader.snapshot_all()
@@ -2595,12 +2668,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self._queue_action(self.path.rsplit('/', 1)[1], q)
         elif self.path == '/api/settings':
-            value = payload.get('max_active')
-            if not valid_max_active(value):
+            down, up, value = payload.get('limit_down_mbit'), payload.get('limit_up_mbit'), payload.get('max_active')
+            for v in (down, up):
+                if v is not None and not ratelimit.valid_mbit(v):
+                    self._send_error_json(f"Лимит скорости: целое число Мбит/с от 0 до {ratelimit.LIMIT_MAX} (0 — без ограничения)")
+                    return
+            if value is not None and not valid_max_active(value):
                 self._send_error_json(f"Число очередей: от 1 до {MAX_ACTIVE_LIMIT}")
                 return
-            set_max_active(value)
-            self._send_json({"status": "ok", "max_active": value})
+            if value is None and down is None and up is None:
+                self._send_error_json("Нечего менять")
+                return
+            if value is not None:
+                set_max_active(value)
+            set_limits(down, up)
+            self._send_json({"status": "ok", "max_active": app_state["max_active"],
+                             "limit_down_mbit": ratelimit.DOWN.mbit, "limit_up_mbit": ratelimit.UP.mbit})
         elif self.path == '/api/shutdown':
             stop_all_for_quit()
             add_log("⏻ Программа выключается.")
@@ -2720,6 +2803,9 @@ def resume_unfinished():
     session = load_session()
     if valid_max_active(session.get('max_active')):
         app_state["max_active"] = session['max_active']
+    for bucket, key in ((ratelimit.DOWN, 'limit_down_mbit'), (ratelimit.UP, 'limit_up_mbit')):
+        if ratelimit.valid_mbit(session.get(key)):
+            bucket.set_mbit(session[key])
 
     restored = []
     for entry in session_queue_entries(session):
