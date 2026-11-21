@@ -174,7 +174,7 @@ def start_result(args, base, res, what):
 
 
 def cmd_upload(args, base):
-    payload = {'sources': args.sources, 'remote': args.to, 'threads': args.threads, 'order': args.order or ''}
+    payload = {'sources': args.sources, 'remote': args.to, 'threads': args.threads, 'order': args.order or '', 'plain': args.plain}
     return start_result(args, base, call(base, '/api/upload/start', payload), 'Заливка не началась')
 
 
@@ -222,6 +222,7 @@ def parser():
     u.add_argument('sources', nargs='+', help='локальные папки и файлы (на той машине, где загрузчик)')
     u.add_argument('--to', required=True, help='папка на Диске, например «Рендеры заказов/3909_Подкаст/v1»')
     u.add_argument('--threads', type=int, default=16)
+    u.add_argument('--plain', action='store_true', help='файлы до 25 МБ лить сразу под своим именем, без временного .ydupload.txt (крупнее всё равно идут через него: Яндекс рвёт заливку .mp4)')
 
     d = sub.add_parser('download', help='скачать по ссылкам Я.Диска / Google Drive / ORV Cloud')
     d.add_argument('urls', nargs='+')

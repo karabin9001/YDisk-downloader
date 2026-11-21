@@ -395,8 +395,9 @@ def new_state():
 
 class UploadQueue:
     def __init__(self, sources, remote, threads=DEFAULT_THREADS, token=None, queue_id=None,
-                 paused=False, had_token=False, public_url='', order=''):
+                 paused=False, had_token=False, public_url='', order='', plain=False):
         self.id = queue_id or secrets.token_hex(4)
+        self.plain = bool(plain)          # True: лить под настоящим именем, без обхода «.ydupload.txt» (видео с превью на Диске)
         self.order = clean_order(order)
         self.sources = list(sources)
         self.remote = remote
@@ -569,7 +570,7 @@ def upload_one(q, item, sess):
     """Заливает один файл с повторами. Возвращает 'done', 'failed' или 'stopped'."""
     token = q.token
     last_error = ''
-    tmp = temp_remote(item['remote'])
+    tmp = item['remote'] if getattr(q, 'plain', False) else temp_remote(item['remote'])
     for attempt in range(1, FILE_RETRIES + 1):
         if q.abort.is_set():
             return 'stopped'
@@ -825,7 +826,7 @@ def valid_threads(value):
     return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_THREADS
 
 
-def add(sources, remote, threads=DEFAULT_THREADS, token=None, order=''):
+def add(sources, remote, threads=DEFAULT_THREADS, token=None, order='', plain=False):
     """Новая очередь заливки. Возвращает (очередь, None) или (None, текст ошибки)."""
     sources = [str(Path(s).expanduser()) for s in sources if str(s).strip()]
     if not sources:
@@ -842,7 +843,7 @@ def add(sources, remote, threads=DEFAULT_THREADS, token=None, order=''):
     token = token or load_server_token()
     if not token:
         return None, 'Нужен токен Яндекс.Диска: впишите его в поле «Токен»'
-    q = UploadQueue(sources, remote, threads, token, order=order)
+    q = UploadQueue(sources, remote, threads, token, order=order, plain=plain)
     with ulock:
         for other in uploads:
             if other.state['is_running'] and other.remote == remote and set(other.sources) == set(sources):

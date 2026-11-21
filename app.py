@@ -2660,7 +2660,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         remote = str(payload.get('remote', '')).strip()
         threads = payload.get('threads', uploader.DEFAULT_THREADS)
         token = str(payload.get('token', '')).strip() or None
-        q, error = uploader.add(sources, remote, threads, token, order=str(payload.get('order') or ''))
+        q, error = uploader.add(sources, remote, threads, token, order=str(payload.get('order') or ''), plain=bool(payload.get('plain')))
         if error:
             self._send_error_json(error)
             return
