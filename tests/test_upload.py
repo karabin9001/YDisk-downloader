@@ -597,6 +597,37 @@ class ControlTest(Base):
         self.assertEqual(len(self.fake.files), 3)
         self.assertEqual(app.load_session().get('uploads'), [])
 
+    def test_private_is_not_published(self):
+        q, error = uploader.add([str(self.project())], 'Пульт/Заказ', 4, TOKEN, private=True)
+        self.assertIsNone(error)
+        snap = self.finish(q)
+        self.assertEqual(snap['display'], 'done', snap['logs'])
+        self.assertEqual(len(self.fake.files), 3)
+        self.assertEqual(self.fake.public, {})                       # публичной ссылки нет
+        self.assertEqual((snap['public_url'], snap['private']), ('', True))
+        q2, _ = uploader.add([str(self.tmp / 'Проект' / 'a.mp4')], 'Заливка/Обычная', 4, TOKEN)   # обычная — как раньше
+        self.assertTrue(self.finish(q2)['public_url'])
+
+    def test_private_survives_restart(self):
+        src = self.files(3)
+        self.fake.hold = threading.Event()
+        q, _ = uploader.add([str(src)], 'Пульт/Заказ', 1, TOKEN, private=True)
+        self.wait(lambda: self.fake.in_flight == 1, 'заливка идёт')
+        uploader.stop_all_for_quit()
+        self.finish(q)
+        entries = app.load_session().get('uploads')
+        self.assertIs(entries[0]['private'], True)
+        uploader.uploads.clear()
+        uploader.flags['quitting'] = False
+        os.environ['YANDEX_DISK_TOKEN'] = TOKEN
+        self.fake.hold.set()
+        restored = uploader.restore(entries)
+        self.assertEqual(self.finish(restored[0])['display'], 'done')
+        self.assertEqual(self.fake.public, {})                       # и после перезапуска не опубликовалась
+        self.assertIsNone(uploader.restart(restored[0]))
+        self.finish(restored[0])
+        self.assertEqual(self.fake.public, {})
+
     def test_restore_without_token_or_source_is_blocked(self):
         entries = [{'id': 'a1', 'sources': [str(self.tmp / 'нет')], 'remote': 'disk:/R', 'threads': 4},
                    {'id': 'b2', 'sources': [str(self.files(1))], 'remote': 'disk:/R', 'threads': 4}]

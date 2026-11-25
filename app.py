@@ -2633,6 +2633,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "logs": app_state["logs"],
                 }, ensure_ascii=False))
             snapshot["uploads"] = uploader.snapshot_all()
+            snapshot["features"] = ["private_upload"]      # агент проверяет это, прежде чем доверить закрытую заливку
             self._send_json(snapshot)
         else:
             self.send_error(404)
@@ -2743,11 +2744,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         remote = str(payload.get('remote', '')).strip()
         threads = payload.get('threads', uploader.DEFAULT_THREADS)
         token = str(payload.get('token', '')).strip() or None
-        q, error = uploader.add(sources, remote, threads, token, order=str(payload.get('order') or ''), plain=bool(payload.get('plain')))
+        q, error = uploader.add(sources, remote, threads, token, order=str(payload.get('order') or ''), plain=bool(payload.get('plain')),
+                                  private=payload.get('private') is True)
         if error:
             self._send_error_json(error)
             return
-        update_session(upload_remote=remote, upload_threads=threads)
+        if not q.private:                         # закрытые заливки заводит агент: поля окна Ивана не трогаем
+            update_session(upload_remote=remote, upload_threads=threads)
         self._send_json({"status": "started", "id": q.id})
 
     def _upload_action(self, action, q, payload):

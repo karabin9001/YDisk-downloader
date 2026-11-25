@@ -438,9 +438,10 @@ def new_state():
 
 class UploadQueue:
     def __init__(self, sources, remote, threads=DEFAULT_THREADS, token=None, queue_id=None,
-                 paused=False, had_token=False, public_url='', order='', plain=False):
+                 paused=False, had_token=False, public_url='', order='', plain=False, private=False):
         self.id = queue_id or secrets.token_hex(4)
         self.plain = bool(plain)          # True: файлы до PLAIN_MAX лить под настоящим именем; крупнее — всё равно через «.ydupload.txt»
+        self.private = bool(private)      # True: папку на Диске не публиковать (публичной ссылки не будет)
         self.order = clean_order(order)
         self.sources = list(sources)
         self.remote = remote
@@ -537,7 +538,7 @@ class UploadQueue:
                           "чтобы не терять отправленное: прервать их можно кнопкой «Стоп».")
             data = {k: v for k, v in st.items() if k != 'failed'}
             data.update(
-                id=self.id, kind='upload', order=self.order, sources=self.sources, remote=self.remote, threads=self.threads,
+                id=self.id, kind='upload', order=self.order, private=self.private, sources=self.sources, remote=self.remote, threads=self.threads,
                 display=self.display_status(), active=active, pending_files=len(self.pending),
                 failed=st['failed'][-100:], failed_count=len(st['failed']),
                 progress_bytes=progress, notice=notice,
@@ -551,7 +552,7 @@ class UploadQueue:
     def session_entry(self):
         return {'id': self.id, 'order': self.order, 'sources': self.sources, 'remote': self.remote, 'threads': self.threads,
                 'paused': self.state['is_paused'], 'had_token': self.had_token,
-                'public_url': self.state['public_url']}
+                'public_url': self.state['public_url'], 'private': self.private}
 
     # ---------- запуск ----------
 
@@ -826,6 +827,9 @@ def run_upload(q):
         q.log(f"⚠️ Контрольная уборка временных файлов не прошла: {e}")
     if st['failed']:
         return
+    if q.private:
+        q.log("🔒 Закрытая заливка: папку не публикую")
+        return
     q.set_phase('publishing', 'Публикую папку…')
     url = with_retries(q, lambda: publish(sess, q.token, q.remote), 'Публикация папки')
     with ulock:
@@ -893,7 +897,7 @@ def valid_threads(value):
     return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_THREADS
 
 
-def add(sources, remote, threads=DEFAULT_THREADS, token=None, order='', plain=False):
+def add(sources, remote, threads=DEFAULT_THREADS, token=None, order='', plain=False, private=False):
     """Новая очередь заливки. Возвращает (очередь, None) или (None, текст ошибки)."""
     sources = [str(Path(s).expanduser()) for s in sources if str(s).strip()]
     if not sources:
@@ -910,7 +914,7 @@ def add(sources, remote, threads=DEFAULT_THREADS, token=None, order='', plain=Fa
     token = token or load_server_token()
     if not token:
         return None, 'Нужен токен Яндекс.Диска: впишите его в поле «Токен»'
-    q = UploadQueue(sources, remote, threads, token, order=order, plain=plain)
+    q = UploadQueue(sources, remote, threads, token, order=order, plain=plain, private=private)
     with ulock:
         for other in uploads:
             if other.state['is_running'] and other.remote == remote and set(other.sources) == set(sources):
@@ -1034,7 +1038,8 @@ def restore(entries, log=print):
         threads = e.get('threads') if valid_threads(e.get('threads')) else DEFAULT_THREADS
         q = UploadQueue(e['sources'], e['remote'], threads, server_token, queue_id=e.get('id'),
                         paused=bool(e.get('paused')), had_token=bool(e.get('had_token')),
-                        public_url=e.get('public_url') or '', order=e.get('order') or '')
+                        public_url=e.get('public_url') or '', order=e.get('order') or '',
+                        private=bool(e.get('private')))
         restored.append(q)
     with ulock:
         uploads.extend(restored)
